@@ -1,64 +1,84 @@
 # File: apigen/models.py
 """
-NexaFlow APIGen - Model Definitions
-====================================
-Enterprise-grade Pydantic V2 models for database schema representation.
-Generates SQLAlchemy ORM models and Pydantic schemas from definitions.
+NexaFlow APIGen - Core Data Models
+===================================
+Pydantic V2 models representing database schema elements and code generation
+configuration. These models form the single source of truth for the entire
+pipeline: Schema Parsing → Validation → Code Generation → Export.
 
-Performance: O(n) generation with pre-computed type mappings.
+Performance target: All model instantiation and serialization must operate
+at O(1) per-entity to support 50,000+ line generation in <30 seconds.
 """
 
 from __future__ import annotations
 
-import re
 import logging
+from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional, Set, Union
-from dataclasses import dataclass, field as dataclass_field
+from typing import Any, Dict, FrozenSet, List, Literal, Optional, Set, Tuple, Union
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    computed_field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
-# ============================================================
-# LOGGING SETUP
-# ============================================================
+# ---------------------------------------------------------------------------
+# Logger
+# ---------------------------------------------------------------------------
+logger: logging.Logger = logging.getLogger("apigen.models")
 
-logger = logging.getLogger("apigen.models")
+# ---------------------------------------------------------------------------
+# Enums — fixed sets used across the entire project
+# ---------------------------------------------------------------------------
 
 
-# ============================================================
-# ENUMERATIONS
-# ============================================================
+class ColumnType(str, Enum):
+    """Supported SQL / SQLAlchemy column types."""
 
-class FieldType(str, Enum):
-    """
-    Supported database field types.
-    Using str mixin for direct JSON serialization and string comparison.
-    """
+    # Numeric
+    INTEGER = "integer"
+    BIGINTEGER = "biginteger"
+    SMALLINTEGER = "smallinteger"
+    FLOAT = "float"
+    NUMERIC = "numeric"
+    DOUBLE = "double"
+    BOOLEAN = "boolean"
+
+    # String / Binary
     STRING = "string"
     TEXT = "text"
-    INTEGER = "integer"
-    FLOAT = "float"
-    DECIMAL = "decimal"
-    BOOLEAN = "boolean"
-    DATETIME = "datetime"
+    VARCHAR = "varchar"
+    CHAR = "char"
+    BINARY = "binary"
+    LARGEBINARY = "largebinary"
+
+    # Date / Time
     DATE = "date"
+    DATETIME = "datetime"
     TIME = "time"
-    EMAIL = "email"
-    URL = "url"
+    TIMESTAMP = "timestamp"
+    INTERVAL = "interval"
+
+    # Special
     UUID = "uuid"
     JSON = "json"
+    JSONB = "jsonb"
+    ARRAY = "array"
     ENUM = "enum"
-    FILE = "file"
-    IMAGE = "image"
-    PASSWORD = "password"
-    PHONE = "phone"
-    SLUG = "slug"
-    IP_ADDRESS = "ip_address"
-    BINARY = "binary"
+    HSTORE = "hstore"
+    INET = "inet"
+    CIDR = "cidr"
+    MACADDR = "macaddr"
 
 
-class RelationType(str, Enum):
-    """Database relationship cardinality types."""
+class RelationshipType(str, Enum):
+    """ORM relationship cardinalities."""
+
     ONE_TO_ONE = "one_to_one"
     ONE_TO_MANY = "one_to_many"
     MANY_TO_ONE = "many_to_one"
@@ -66,1315 +86,1053 @@ class RelationType(str, Enum):
 
 
 class IndexType(str, Enum):
-    """Database index types."""
-    NORMAL = "index"
+    """Supported index kinds."""
+
+    BTREE = "btree"
+    HASH = "hash"
+    GIN = "gin"
+    GIST = "gist"
+    BRIN = "brin"
     UNIQUE = "unique"
-    COMPOSITE = "composite"
-    FULLTEXT = "fulltext"
 
 
-class OnDelete(str, Enum):
-    """Foreign key ON DELETE referential actions."""
+class OnDeleteAction(str, Enum):
+    """Foreign-key ON DELETE behaviour."""
+
     CASCADE = "CASCADE"
     SET_NULL = "SET NULL"
+    SET_DEFAULT = "SET DEFAULT"
     RESTRICT = "RESTRICT"
     NO_ACTION = "NO ACTION"
+
+
+class OnUpdateAction(str, Enum):
+    """Foreign-key ON UPDATE behaviour."""
+
+    CASCADE = "CASCADE"
+    SET_NULL = "SET NULL"
     SET_DEFAULT = "SET DEFAULT"
+    RESTRICT = "RESTRICT"
+    NO_ACTION = "NO ACTION"
 
 
-# ============================================================
-# PRE-COMPUTED TYPE MAPPINGS (O(1) lookup)
-# ============================================================
+class AuthStrategy(str, Enum):
+    """Supported authentication strategies for generated APIs."""
 
-SQLALCHEMY_TYPE_MAP: Dict[FieldType, str] = {
-    FieldType.STRING: "String({max_length})",
-    FieldType.TEXT: "Text",
-    FieldType.INTEGER: "Integer",
-    FieldType.FLOAT: "Float",
-    FieldType.DECIMAL: "Numeric(precision={precision}, scale={scale})",
-    FieldType.BOOLEAN: "Boolean",
-    FieldType.DATETIME: "DateTime(timezone=True)",
-    FieldType.DATE: "Date",
-    FieldType.TIME: "Time",
-    FieldType.EMAIL: "String(320)",
-    FieldType.URL: "String(2048)",
-    FieldType.UUID: "String(36)",
-    FieldType.JSON: "JSON",
-    FieldType.ENUM: "String(50)",
-    FieldType.FILE: "String(512)",
-    FieldType.IMAGE: "String(512)",
-    FieldType.PASSWORD: "String(128)",
-    FieldType.PHONE: "String(20)",
-    FieldType.SLUG: "String({max_length})",
-    FieldType.IP_ADDRESS: "String(45)",
-    FieldType.BINARY: "LargeBinary",
-}
-
-PYDANTIC_TYPE_MAP: Dict[FieldType, str] = {
-    FieldType.STRING: "str",
-    FieldType.TEXT: "str",
-    FieldType.INTEGER: "int",
-    FieldType.FLOAT: "float",
-    FieldType.DECIMAL: "Decimal",
-    FieldType.BOOLEAN: "bool",
-    FieldType.DATETIME: "datetime",
-    FieldType.DATE: "date",
-    FieldType.TIME: "time",
-    FieldType.EMAIL: "EmailStr",
-    FieldType.URL: "HttpUrl",
-    FieldType.UUID: "str",
-    FieldType.JSON: "Dict[str, Any]",
-    FieldType.ENUM: "str",
-    FieldType.FILE: "str",
-    FieldType.IMAGE: "str",
-    FieldType.PASSWORD: "str",
-    FieldType.PHONE: "str",
-    FieldType.SLUG: "str",
-    FieldType.IP_ADDRESS: "str",
-    FieldType.BINARY: "bytes",
-}
-
-# Simple string → FieldType adapter for backward compatibility
-SIMPLE_TYPE_ADAPTER: Dict[str, FieldType] = {
-    "str": FieldType.STRING,
-    "string": FieldType.STRING,
-    "text": FieldType.TEXT,
-    "int": FieldType.INTEGER,
-    "integer": FieldType.INTEGER,
-    "float": FieldType.FLOAT,
-    "decimal": FieldType.DECIMAL,
-    "bool": FieldType.BOOLEAN,
-    "boolean": FieldType.BOOLEAN,
-    "datetime": FieldType.DATETIME,
-    "date": FieldType.DATE,
-    "time": FieldType.TIME,
-    "email": FieldType.EMAIL,
-    "url": FieldType.URL,
-    "uuid": FieldType.UUID,
-    "json": FieldType.JSON,
-    "dict": FieldType.JSON,
-    "enum": FieldType.ENUM,
-    "file": FieldType.FILE,
-    "image": FieldType.IMAGE,
-    "password": FieldType.PASSWORD,
-    "phone": FieldType.PHONE,
-    "slug": FieldType.SLUG,
-    "ip": FieldType.IP_ADDRESS,
-    "ip_address": FieldType.IP_ADDRESS,
-    "binary": FieldType.BINARY,
-}
-
-# Auto-generated field names (excluded from user fields)
-AUTO_FIELD_NAMES: frozenset = frozenset({
-    "id", "created_at", "updated_at", "deleted_at", "is_deleted",
-})
-
-# Field types suitable for text search
-SEARCHABLE_FIELD_TYPES: frozenset = frozenset({
-    FieldType.STRING, FieldType.TEXT, FieldType.EMAIL,
-    FieldType.SLUG, FieldType.PHONE,
-})
+    NONE = "none"
+    API_KEY = "api_key"
+    JWT = "jwt"
+    OAUTH2 = "oauth2"
 
 
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
+class PaginationStyle(str, Enum):
+    """Pagination flavours for list endpoints."""
 
-def resolve_field_type(type_input: Any) -> FieldType:
-    """
-    Resolve any type input to a FieldType enum.
-    
-    Accepts:
-        - FieldType enum directly → O(1) passthrough
-        - String name (e.g. "str", "email") → O(1) dict lookup
-        - Python type objects (str, int, etc.) → O(1) dict lookup
-    
-    Args:
-        type_input: Field type as FieldType, string, or Python type.
-    
-    Returns:
-        Resolved FieldType enum.
-    
-    Raises:
-        ValueError: If type cannot be resolved.
-    """
-    if isinstance(type_input, FieldType):
-        return type_input
-    
-    if isinstance(type_input, str):
-        normalized = type_input.lower().strip()
-        resolved = SIMPLE_TYPE_ADAPTER.get(normalized)
-        if resolved is not None:
-            return resolved
-        try:
-            return FieldType(normalized)
-        except ValueError:
-            pass
-        raise ValueError(
-            f"Unknown field type: '{type_input}'. "
-            f"Valid types: {sorted(SIMPLE_TYPE_ADAPTER.keys())}"
-        )
-    
-    python_type_map: Dict[type, FieldType] = {
-        str: FieldType.STRING,
-        int: FieldType.INTEGER,
-        float: FieldType.FLOAT,
-        bool: FieldType.BOOLEAN,
-        bytes: FieldType.BINARY,
-        dict: FieldType.JSON,
-        list: FieldType.JSON,
-    }
-    resolved = python_type_map.get(type_input)
-    if resolved is not None:
-        return resolved
-    
-    raise ValueError(
-        f"Cannot resolve field type from: {type_input!r} (type={type(type_input).__name__})"
+    OFFSET = "offset"
+    CURSOR = "cursor"
+    PAGE_NUMBER = "page_number"
+
+
+class NamingConvention(str, Enum):
+    """Code-generation naming conventions."""
+
+    SNAKE_CASE = "snake_case"
+    CAMEL_CASE = "camelCase"
+    PASCAL_CASE = "PascalCase"
+
+
+class DatabaseDialect(str, Enum):
+    """Target database dialects."""
+
+    POSTGRESQL = "postgresql"
+    MYSQL = "mysql"
+    SQLITE = "sqlite"
+    MSSQL = "mssql"
+    ORACLE = "oracle"
+
+
+# ---------------------------------------------------------------------------
+# Mixin: shared model configuration
+# ---------------------------------------------------------------------------
+
+_SHARED_CONFIG: ConfigDict = ConfigDict(
+    strict=False,
+    populate_by_name=True,
+    validate_assignment=True,
+    use_enum_values=True,
+    frozen=False,
+    extra="forbid",
+)
+
+
+# ---------------------------------------------------------------------------
+# Low-level schema primitives
+# ---------------------------------------------------------------------------
+
+
+class ColumnConstraint(BaseModel):
+    """A single column-level constraint (CHECK, DEFAULT, etc.)."""
+
+    model_config = _SHARED_CONFIG
+
+    name: Optional[str] = Field(default=None, description="Constraint name (optional).")
+    expression: str = Field(
+        ...,
+        min_length=1,
+        description="SQL expression, e.g. 'age > 0' or 'now()'.",
+    )
+    constraint_type: Literal["check", "default", "unique", "exclude"] = Field(
+        ..., description="Kind of constraint."
+    )
+
+    def __repr__(self) -> str:
+        return f"<ColumnConstraint {self.constraint_type}: {self.expression}>"
+
+
+class EnumDefinition(BaseModel):
+    """Represents an SQL ENUM type."""
+
+    model_config = _SHARED_CONFIG
+
+    name: str = Field(..., min_length=1, description="Enum type name.")
+    values: List[str] = Field(
+        ..., min_length=1, description="Allowed values for this enum."
+    )
+    schema_name: Optional[str] = Field(
+        default=None, description="Database schema (e.g. 'public')."
+    )
+
+    @field_validator("values")
+    @classmethod
+    def _unique_values(cls, v: List[str]) -> List[str]:
+        if len(v) != len(set(v)):
+            dupes: List[str] = [x for x in v if v.count(x) > 1]
+            raise ValueError(f"Duplicate enum values detected: {dupes}")
+        return v
+
+
+class ColumnDefault(BaseModel):
+    """Column default value descriptor."""
+
+    model_config = _SHARED_CONFIG
+
+    is_server_default: bool = Field(
+        default=False,
+        description="True if the default is evaluated server-side (e.g. now()).",
+    )
+    value: Any = Field(..., description="Default value or SQL expression string.")
+    is_clause: bool = Field(
+        default=False,
+        description="True when value is raw SQL text, not a literal.",
     )
 
 
-def pluralize(name: str) -> str:
+class ColumnInfo(BaseModel):
     """
-    Simple English pluralization for table names.
-    Covers 95% of common model names.
-    
-    Args:
-        name: Singular lowercase name.
-    
-    Returns:
-        Pluralized name.
-    """
-    if not name:
-        return name
-    
-    if name.endswith("y") and len(name) > 1 and name[-2:] not in ("ay", "ey", "oy", "uy"):
-        return name[:-1] + "ies"
-    elif name.endswith(("s", "sh", "ch", "x", "z")):
-        return name + "es"
-    return name + "s"
+    Complete specification of a single database column.
 
-
-def to_snake_case(name: str) -> str:
+    This is the most granular building block.  Every column in every table
+    in the parsed schema becomes exactly one ``ColumnInfo`` instance.
     """
-    Convert PascalCase/camelCase to snake_case.
-    
-    Args:
-        name: Input string in any case.
-    
-    Returns:
-        snake_case string.
-    """
-    s1 = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", name)
-    return re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s1).lower()
 
+    model_config = _SHARED_CONFIG
 
-def to_pascal_case(name: str) -> str:
-    """
-    Convert snake_case/kebab-case to PascalCase.
-    
-    Args:
-        name: Input string.
-    
-    Returns:
-        PascalCase string.
-    """
-    if "_" in name:
-        return "".join(w.capitalize() for w in name.split("_"))
-    if "-" in name:
-        return "".join(w.capitalize() for w in name.split("-"))
-    return name[0].upper() + name[1:] if name else name
+    name: str = Field(..., min_length=1, description="Column name.")
+    column_type: ColumnType = Field(..., description="Abstract SQL type.")
+    max_length: Optional[int] = Field(
+        default=None, ge=1, description="Max length for VARCHAR / CHAR."
+    )
+    precision: Optional[int] = Field(
+        default=None, ge=0, description="Precision for NUMERIC / DECIMAL."
+    )
+    scale: Optional[int] = Field(
+        default=None, ge=0, description="Scale for NUMERIC / DECIMAL."
+    )
+    nullable: bool = Field(default=True, description="Whether the column allows NULL.")
+    primary_key: bool = Field(default=False, description="Part of the primary key?")
+    autoincrement: bool = Field(
+        default=False, description="Auto-increment (SERIAL, IDENTITY, etc.)."
+    )
+    unique: bool = Field(default=False, description="Has a UNIQUE constraint?")
+    index: bool = Field(default=False, description="Should a single-column index be created?")
+    default: Optional[ColumnDefault] = Field(
+        default=None, description="Default value descriptor."
+    )
+    server_default: Optional[str] = Field(
+        default=None, description="Raw SQL server_default expression."
+    )
+    comment: Optional[str] = Field(default=None, description="Column comment / doc.")
+    constraints: List[ColumnConstraint] = Field(
+        default_factory=list, description="Extra constraints."
+    )
+    enum_definition: Optional[EnumDefinition] = Field(
+        default=None,
+        description="Enum type info (only when column_type == 'enum').",
+    )
+    array_item_type: Optional[ColumnType] = Field(
+        default=None,
+        description="Element type when column_type == 'array'.",
+    )
+    json_schema: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Optional JSON Schema for json/jsonb columns.",
+    )
 
+    # -- Derived helpers (computed_field keeps them out of __init__) ---------
 
-# ============================================================
-# FIELD CONSTRAINT (Pydantic V2)
-# ============================================================
+    @computed_field  # type: ignore[misc]
+    @property
+    def is_numeric(self) -> bool:
+        return self.column_type in {
+            ColumnType.INTEGER,
+            ColumnType.BIGINTEGER,
+            ColumnType.SMALLINTEGER,
+            ColumnType.FLOAT,
+            ColumnType.NUMERIC,
+            ColumnType.DOUBLE,
+        }
 
-class FieldConstraint(BaseModel):
-    """
-    Validation constraints for a database field.
-    Applied at both Pydantic schema level and optionally at database level.
-    """
-    min_length: Optional[int] = Field(default=None, ge=0)
-    max_length: Optional[int] = Field(default=None, ge=1)
-    min_value: Optional[float] = Field(default=None)
-    max_value: Optional[float] = Field(default=None)
-    regex_pattern: Optional[str] = Field(default=None)
-    allowed_values: Optional[List[str]] = Field(default=None)
-    custom_validator: Optional[str] = Field(default=None)
-    
+    @computed_field  # type: ignore[misc]
+    @property
+    def is_string(self) -> bool:
+        return self.column_type in {
+            ColumnType.STRING,
+            ColumnType.TEXT,
+            ColumnType.VARCHAR,
+            ColumnType.CHAR,
+        }
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def is_temporal(self) -> bool:
+        return self.column_type in {
+            ColumnType.DATE,
+            ColumnType.DATETIME,
+            ColumnType.TIME,
+            ColumnType.TIMESTAMP,
+            ColumnType.INTERVAL,
+        }
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def python_type_hint(self) -> str:
+        """Return the corresponding Python type-hint string for code generation."""
+        _MAP: Dict[str, str] = {
+            "integer": "int",
+            "biginteger": "int",
+            "smallinteger": "int",
+            "float": "float",
+            "numeric": "Decimal",
+            "double": "float",
+            "boolean": "bool",
+            "string": "str",
+            "text": "str",
+            "varchar": "str",
+            "char": "str",
+            "binary": "bytes",
+            "largebinary": "bytes",
+            "date": "date",
+            "datetime": "datetime",
+            "time": "time",
+            "timestamp": "datetime",
+            "interval": "timedelta",
+            "uuid": "UUID",
+            "json": "Any",
+            "jsonb": "Any",
+            "array": "List[Any]",
+            "enum": "str",
+            "hstore": "Dict[str, str]",
+            "inet": "str",
+            "cidr": "str",
+            "macaddr": "str",
+        }
+        base: str = _MAP.get(self.column_type, "Any")
+        if self.nullable and not self.primary_key:
+            return f"Optional[{base}]"
+        return base
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def sqlalchemy_type_str(self) -> str:
+        """SQLAlchemy type constructor string for code generation."""
+        _MAP: Dict[str, str] = {
+            "integer": "Integer",
+            "biginteger": "BigInteger",
+            "smallinteger": "SmallInteger",
+            "float": "Float",
+            "numeric": f"Numeric(precision={self.precision}, scale={self.scale})"
+            if self.precision is not None
+            else "Numeric",
+            "double": "Double",
+            "boolean": "Boolean",
+            "string": f"String({self.max_length})" if self.max_length else "String",
+            "text": "Text",
+            "varchar": f"String({self.max_length})" if self.max_length else "String",
+            "char": f"CHAR({self.max_length})" if self.max_length else "CHAR",
+            "binary": "LargeBinary",
+            "largebinary": "LargeBinary",
+            "date": "Date",
+            "datetime": "DateTime",
+            "time": "Time",
+            "timestamp": "DateTime(timezone=True)",
+            "interval": "Interval",
+            "uuid": "UUID(as_uuid=True)",
+            "json": "JSON",
+            "jsonb": "JSONB",
+            "array": f"ARRAY({self.array_item_type.value.capitalize() if self.array_item_type else 'Text'})",
+            "enum": f"SQLEnum({', '.join(repr(v) for v in (self.enum_definition.values if self.enum_definition else []))},"
+            f" name='{self.enum_definition.name if self.enum_definition else 'unknown'}')",
+            "hstore": "HSTORE",
+            "inet": "INET",
+            "cidr": "CIDR",
+            "macaddr": "MACADDR",
+        }
+        return _MAP.get(self.column_type, "String")
+
+    # -- Validators ---------------------------------------------------------
+
     @model_validator(mode="after")
-    def validate_length_range(self) -> "FieldConstraint":
-        """Ensure min_length <= max_length if both are set."""
-        if self.min_length is not None and self.max_length is not None:
-            if self.min_length > self.max_length:
-                raise ValueError(
-                    f"min_length ({self.min_length}) cannot exceed "
-                    f"max_length ({self.max_length})"
-                )
+    def _validate_enum_has_definition(self) -> "ColumnInfo":
+        if self.column_type == ColumnType.ENUM and self.enum_definition is None:
+            raise ValueError(
+                f"Column '{self.name}' is of type ENUM but 'enum_definition' is missing."
+            )
         return self
-    
+
     @model_validator(mode="after")
-    def validate_value_range(self) -> "FieldConstraint":
-        """Ensure min_value <= max_value if both are set."""
-        if self.min_value is not None and self.max_value is not None:
-            if self.min_value > self.max_value:
-                raise ValueError(
-                    f"min_value ({self.min_value}) cannot exceed "
-                    f"max_value ({self.max_value})"
-                )
-        return self
-    
-    def has_constraints(self) -> bool:
-        """Check if any constraint is actively set. O(1)."""
-        return (
-            self.min_length is not None
-            or self.max_length is not None
-            or self.min_value is not None
-            or self.max_value is not None
-            or self.regex_pattern is not None
-            or self.allowed_values is not None
-            or self.custom_validator is not None
-        )
-    
-    def to_pydantic_field_args(self) -> Dict[str, Any]:
-        """Convert constraints to Pydantic Field() keyword arguments."""
-        args: Dict[str, Any] = {}
-        if self.min_length is not None:
-            args["min_length"] = self.min_length
-        if self.max_length is not None:
-            args["max_length"] = self.max_length
-        if self.min_value is not None:
-            args["ge"] = self.min_value
-        if self.max_value is not None:
-            args["le"] = self.max_value
-        return args
-
-
-# ============================================================
-# MODEL FIELD (Pydantic V2)
-# ============================================================
-
-class ModelField(BaseModel):
-    """
-    Complete definition of a single database model field.
-    
-    Generates:
-    - SQLAlchemy Column(...) definitions
-    - Pydantic schema field definitions
-    - Pydantic validators
-    """
-    
-    # Identity
-    name: str = Field(..., min_length=1, max_length=64)
-    field_type: FieldType
-    
-    # Behavior
-    required: bool = Field(default=True)
-    unique: bool = Field(default=False)
-    indexed: bool = Field(default=False)
-    nullable: bool = Field(default=False)
-    primary_key: bool = Field(default=False)
-    auto_increment: bool = Field(default=False)
-    
-    # Values
-    default: Optional[Any] = Field(default=None)
-    server_default: Optional[str] = Field(default=None)
-    max_length: int = Field(default=255, ge=1, le=65535)
-    precision: int = Field(default=10, ge=1, le=65)
-    scale: int = Field(default=2, ge=0, le=30)
-    
-    # Metadata
-    description: Optional[str] = Field(default=None, max_length=500)
-    enum_values: Optional[List[str]] = Field(default=None)
-    constraint: Optional[FieldConstraint] = Field(default=None)
-    
-    # Foreign key reference
-    foreign_key: Optional[str] = Field(default=None)
-    
-    @field_validator("name")
-    @classmethod
-    def validate_name_format(cls, v: str) -> str:
-        """Ensure name is a valid Python identifier."""
-        if not v.isidentifier():
-            raise ValueError(f"'{v}' is not a valid Python identifier")
-        return v
-    
-    @model_validator(mode="after")
-    def validate_enum_has_values(self) -> "ModelField":
-        """Ensure enum fields have values defined."""
-        if self.field_type == FieldType.ENUM and not self.enum_values:
+    def _validate_array_item_type(self) -> "ColumnInfo":
+        if self.column_type == ColumnType.ARRAY and self.array_item_type is None:
             logger.warning(
-                "Enum field '%s' has no enum_values defined. "
-                "This will generate a plain string column.",
+                "Column '%s' is ARRAY without explicit array_item_type; "
+                "defaulting to TEXT.",
                 self.name,
             )
         return self
-    
-    # ---- SQLAlchemy Generation ----
-    
-    def to_sqlalchemy(self) -> str:
-        """
-        Generate SQLAlchemy Column(...) definition string.
-        
-        Returns:
-            Complete Column definition.
-        """
-        sa_template = SQLALCHEMY_TYPE_MAP.get(self.field_type, "String(255)")
-        col_type = sa_template.format(
-            max_length=self.max_length,
-            precision=self.precision,
-            scale=self.scale,
-        )
-        
-        parts: List[str] = [f"Column({col_type}"]
-        
-        if self.primary_key:
-            parts.append("primary_key=True")
-        if self.auto_increment:
-            parts.append("autoincrement=True")
-        if self.foreign_key:
-            parts.append(f'ForeignKey("{self.foreign_key}")')
-        if self.unique:
-            parts.append("unique=True")
-        if self.indexed:
-            parts.append("index=True")
-        if self.nullable:
-            parts.append("nullable=True")
-        elif not self.primary_key:
-            parts.append("nullable=False")
-        
-        if self.default is not None:
-            if isinstance(self.default, str):
-                parts.append(f'default="{self.default}"')
-            elif isinstance(self.default, bool):
-                parts.append(f"default={self.default}")
-            else:
-                parts.append(f"default={self.default}")
-        
-        if self.server_default is not None:
-            parts.append(f'server_default=text("{self.server_default}")')
-        
-        return ", ".join(parts) + ")"
-    
-    # ---- Pydantic Generation ----
-    
-    def to_pydantic(self) -> str:
-        """Generate Pydantic field definition for create schema."""
-        py_type = PYDANTIC_TYPE_MAP.get(self.field_type, "str")
-        
-        if not self.required or self.nullable:
-            py_type = f"Optional[{py_type}]"
-        
-        if self.default is not None:
-            if isinstance(self.default, str):
-                return f'    {self.name}: {py_type} = "{self.default}"'
-            else:
-                return f"    {self.name}: {py_type} = {self.default}"
-        elif not self.required:
-            return f"    {self.name}: {py_type} = None"
-        else:
-            return f"    {self.name}: {py_type}"
-    
-    def to_pydantic_update(self) -> str:
-        """Generate Pydantic field for update schema (all optional)."""
-        py_type = PYDANTIC_TYPE_MAP.get(self.field_type, "str")
-        return f"    {self.name}: Optional[{py_type}] = None"
-    
-    # ---- Validator Generation ----
-    
-    def generate_validators(self) -> List[str]:
-        """Generate Pydantic v2 field validators for this field."""
-        validators: List[str] = []
-        
-        if self.constraint and self.constraint.has_constraints():
-            c = self.constraint
-            lines: List[str] = [
-                f'    @field_validator("{self.name}")',
-                f"    @classmethod",
-                f"    def validate_{self.name}(cls, v: Any) -> Any:",
-                f"        if v is None:",
-                f"            return v",
-            ]
-            
-            if c.min_length is not None:
-                lines.append(f"        if len(str(v)) < {c.min_length}:")
-                lines.append(
-                    f'            raise ValueError("{self.name} must be at least {c.min_length} characters")'
-                )
-            
-            if c.max_length is not None:
-                lines.append(f"        if len(str(v)) > {c.max_length}:")
-                lines.append(
-                    f'            raise ValueError("{self.name} must be at most {c.max_length} characters")'
-                )
-            
-            if c.min_value is not None:
-                lines.append(f"        if float(v) < {c.min_value}:")
-                lines.append(
-                    f'            raise ValueError("{self.name} must be >= {c.min_value}")'
-                )
-            
-            if c.max_value is not None:
-                lines.append(f"        if float(v) > {c.max_value}:")
-                lines.append(
-                    f'            raise ValueError("{self.name} must be <= {c.max_value}")'
-                )
-            
-            if c.regex_pattern is not None:
-                lines.append(f"        import re")
-                lines.append(f'        if not re.match(r"{c.regex_pattern}", str(v)):')
-                lines.append(f'            raise ValueError("{self.name} has invalid format")')
-            
-            if c.allowed_values is not None:
-                lines.append(f"        if v not in {c.allowed_values}:")
-                lines.append(f'            raise ValueError("{self.name} must be one of {c.allowed_values}")')
-            
-            lines.append(f"        return v")
-            validators.append("\n".join(lines))
-        
-        # Auto-validators based on field type
-        if self.field_type == FieldType.EMAIL:
-            validators.append(
-                f'    @field_validator("{self.name}")\n'
-                f"    @classmethod\n"
-                f"    def validate_{self.name}_email(cls, v: Any) -> Any:\n"
-                f"        if v is not None and '@' not in str(v):\n"
-                f"            raise ValueError('Invalid email address')\n"
-                f"        return v.lower().strip() if isinstance(v, str) else v"
-            )
-        
-        if self.field_type == FieldType.SLUG:
-            validators.append(
-                f'    @field_validator("{self.name}")\n'
-                f"    @classmethod\n"
-                f"    def validate_{self.name}_slug(cls, v: Any) -> Any:\n"
-                f"        import re\n"
-                f"        if v and not re.match(r'^[a-z0-9]+(?:-[a-z0-9]+)*$', str(v)):\n"
-                f"            raise ValueError('Invalid slug format')\n"
-                f"        return v"
-            )
-        
-        if self.field_type == FieldType.PHONE:
-            validators.append(
-                f'    @field_validator("{self.name}")\n'
-                f"    @classmethod\n"
-                f"    def validate_{self.name}_phone(cls, v: Any) -> Any:\n"
-                f"        import re\n"
-                f"        if v and not re.match(r'^\\+?[0-9\\s\\-()]+$', str(v)):\n"
-                f"            raise ValueError('Invalid phone number format')\n"
-                f"        return v"
-            )
-        
-        return validators
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Serialize field to dictionary."""
-        data: Dict[str, Any] = {
-            "name": self.name,
-            "type": self.field_type.value,
-            "required": self.required,
-            "unique": self.unique,
-            "indexed": self.indexed,
-            "nullable": self.nullable,
-            "max_length": self.max_length,
-        }
-        if self.default is not None:
-            data["default"] = self.default
-        if self.description:
-            data["description"] = self.description
-        if self.enum_values:
-            data["enum_values"] = self.enum_values
-        if self.foreign_key:
-            data["foreign_key"] = self.foreign_key
-        return data
+
+    def __repr__(self) -> str:
+        pk_flag: str = " PK" if self.primary_key else ""
+        null_flag: str = " NULL" if self.nullable else " NOT NULL"
+        return f"<Column {self.name} {self.column_type.value}{pk_flag}{null_flag}>"
 
 
-# ============================================================
-# RELATIONSHIP (Pydantic V2)
-# ============================================================
+# ---------------------------------------------------------------------------
+# Foreign key & relationships
+# ---------------------------------------------------------------------------
 
-class Relationship(BaseModel):
-    """
-    Database relationship between two models.
-    
-    CRITICAL: source_model field tracks the owning model to fix
-    association table foreign key generation bug.
-    """
-    
-    # Required
-    name: str = Field(..., min_length=1, max_length=64)
-    target_model: str = Field(..., min_length=1, max_length=64)
-    relation_type: RelationType
-    
-    # Source tracking (CRITICAL FIX)
-    source_model: Optional[str] = Field(default=None)
-    
-    # Configuration
-    back_populates: Optional[str] = Field(default=None)
-    foreign_key: Optional[str] = Field(default=None)
-    on_delete: OnDelete = Field(default=OnDelete.CASCADE)
-    lazy: str = Field(default="selectin")
-    association_table: Optional[str] = Field(default=None)
-    
-    # ---- Internal Helpers ----
-    
-    def _target_snake(self) -> str:
-        """Convert target model name to snake_case."""
-        return to_snake_case(self.target_model)
-    
-    def _source_snake(self) -> str:
-        """Convert source model name to snake_case."""
-        if self.source_model:
-            return to_snake_case(self.source_model)
-        return "unknown_source"
-    
-    def _target_table(self) -> str:
-        """Derive target database table name."""
-        return pluralize(self._target_snake())
-    
-    def _source_table(self) -> str:
+
+class ForeignKeyInfo(BaseModel):
+    """Describes a single foreign-key reference between two columns."""
+
+    model_config = _SHARED_CONFIG
+
+    constrained_column: str = Field(
+        ..., min_length=1, description="Local column name."
+    )
+    referred_table: str = Field(
+        ..., min_length=1, description="Target table name."
+    )
+    referred_column: str = Field(
+        ..., min_length=1, description="Target column name."
+    )
+    referred_schema: Optional[str] = Field(
+        default=None, description="Target schema (if cross-schema)."
+    )
+    constraint_name: Optional[str] = Field(
+        default=None, description="FK constraint name."
+    )
+    on_delete: OnDeleteAction = Field(
+        default=OnDeleteAction.NO_ACTION,
+        description="ON DELETE referential action.",
+    )
+    on_update: OnUpdateAction = Field(
+        default=OnUpdateAction.NO_ACTION,
+        description="ON UPDATE referential action.",
+    )
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def relationship_attr_name(self) -> str:
         """
-        Derive source database table name.
-        
-        CRITICAL FIX: Now correctly derives from source_model
-        instead of returning hardcoded placeholder.
+        Generate a sensible Python attribute name for the ORM relationship.
+        E.g. ``user_id`` → ``user``, ``author_id`` → ``author``.
         """
-        if self.source_model:
-            return pluralize(self._source_snake())
-        
-        logger.warning(
-            "Relationship '%s' → '%s' has no source_model set. "
-            "Cannot derive correct source table name.",
-            self.name,
-            self.target_model,
-        )
-        return "unknown_sources"
-    
-    # ---- Code Generation ----
-    
-    def to_sqlalchemy_foreign_key(self) -> Optional[str]:
-        """Generate SQLAlchemy foreign key Column definition."""
-        if self.relation_type not in (RelationType.MANY_TO_ONE, RelationType.ONE_TO_ONE):
-            return None
-        
-        fk_name = self.foreign_key or f"{self._target_snake()}_id"
-        target_table = self._target_table()
-        on_del = self.on_delete.value
-        
+        col: str = self.constrained_column
+        if col.endswith("_id"):
+            return col[:-3]
+        return f"{self.referred_table}_ref"
+
+    def __repr__(self) -> str:
         return (
-            f"    {fk_name} = Column(Integer, "
-            f'ForeignKey("{target_table}.id", ondelete="{on_del}"), '
-            f"nullable=True)"
+            f"<FK {self.constrained_column} → "
+            f"{self.referred_table}.{self.referred_column}>"
         )
-    
-    def to_sqlalchemy_relationship(self) -> str:
-        """Generate SQLAlchemy relationship() declaration."""
-        parts: List[str] = [f'relationship("{self.target_model}"']
-        
-        if self.back_populates:
-            parts.append(f'back_populates="{self.back_populates}"')
-        
-        if self.relation_type == RelationType.ONE_TO_MANY:
-            parts.append(f'lazy="{self.lazy}"')
-            if self.on_delete == OnDelete.CASCADE:
-                parts.append('cascade="all, delete-orphan"')
-        
-        elif self.relation_type == RelationType.ONE_TO_ONE:
-            parts.append("uselist=False")
-        
-        elif self.relation_type == RelationType.MANY_TO_MANY:
-            table_name = self._get_association_table_name()
-            parts.append(f"secondary={table_name}")
-            parts.append(f'lazy="{self.lazy}"')
-        
-        return f"    {self.name} = " + ", ".join(parts) + ")"
-    
-    def _get_association_table_name(self) -> str:
-        """Derive association table name for M2M relationships."""
-        if self.association_table:
-            return self.association_table
-        
-        source = self._source_snake()
-        target = self._target_snake()
-        
-        names = sorted([pluralize(source), pluralize(target)])
-        return f"{'_'.join(names)}"
-    
-    def generate_association_table(self) -> Optional[str]:
-        """
-        Generate SQLAlchemy Table() definition for M2M junction tables.
-        
-        CRITICAL FIX: Uses _source_table() which correctly derives
-        from source_model.
-        """
-        if self.relation_type != RelationType.MANY_TO_MANY:
-            return None
-        
-        table_name = self._get_association_table_name()
-        source_table = self._source_table()
-        target_table = self._target_table()
-        on_del = self.on_delete.value
-        
-        source_col = f"{self._source_snake()}_id"
-        target_col = f"{self._target_snake()}_id"
-        
-        logger.debug(
-            "Generating M2M association table: %s (%s ↔ %s)",
-            table_name, source_table, target_table,
-        )
-        
-        lines: List[str] = [
-            f"{table_name} = Table(",
-            f'    "{table_name}",',
-            f"    Base.metadata,",
-            f'    Column("{source_col}", Integer, '
-            f'ForeignKey("{source_table}.id", ondelete="{on_del}"), '
-            f"primary_key=True),",
-            f'    Column("{target_col}", Integer, '
-            f'ForeignKey("{target_table}.id", ondelete="{on_del}"), '
-            f"primary_key=True),",
-            f")",
-        ]
-        return "\n".join(lines)
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Serialize relationship to dictionary."""
-        return {
-            "name": self.name,
-            "target_model": self.target_model,
-            "relation_type": self.relation_type.value,
-            "source_model": self.source_model,
-            "back_populates": self.back_populates,
-            "on_delete": self.on_delete.value,
-            "lazy": self.lazy,
+
+
+class RelationshipInfo(BaseModel):
+    """Describes an ORM-level relationship (derived from foreign keys)."""
+
+    model_config = _SHARED_CONFIG
+
+    name: str = Field(..., min_length=1, description="Attribute name on the model.")
+    relationship_type: RelationshipType = Field(
+        ..., description="Cardinality."
+    )
+    target_table: str = Field(..., min_length=1, description="Related table.")
+    foreign_key: ForeignKeyInfo = Field(
+        ..., description="The underlying foreign key."
+    )
+    back_populates: Optional[str] = Field(
+        default=None, description="back_populates argument for relationship()."
+    )
+    lazy: str = Field(
+        default="select",
+        description="SQLAlchemy lazy loading strategy.",
+    )
+    uselist: Optional[bool] = Field(
+        default=None,
+        description="Explicit uselist flag (None = auto-detect from cardinality).",
+    )
+    secondary_table: Optional[str] = Field(
+        default=None,
+        description="Association table for M2M relationships.",
+    )
+    cascade: str = Field(
+        default="save-update, merge",
+        description="SQLAlchemy cascade string.",
+    )
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def resolved_uselist(self) -> bool:
+        if self.uselist is not None:
+            return self.uselist
+        return self.relationship_type in {
+            RelationshipType.ONE_TO_MANY,
+            RelationshipType.MANY_TO_MANY,
         }
 
-
-# ============================================================
-# MODEL INDEX
-# ============================================================
-
-@dataclass
-class ModelIndex:
-    """Database index definition."""
-    name: str
-    fields: List[str]
-    index_type: IndexType = IndexType.NORMAL
-    
-    def to_sqlalchemy(self, table_name: str) -> str:
-        """Generate SQLAlchemy index/constraint string."""
-        cols = ", ".join(f"'{f}'" for f in self.fields)
-        
-        if self.index_type == IndexType.UNIQUE:
-            return f"UniqueConstraint({cols}, name='{self.name}')"
-        else:
-            return f"Index('{self.name}', {cols})"
+    def __repr__(self) -> str:
+        return f"<Relationship {self.name} ({self.relationship_type}) → {self.target_table}>"
 
 
-# ============================================================
-# DATABASE MODEL (Main Model Definition)
-# ============================================================
+# ---------------------------------------------------------------------------
+# Index & Unique Constraint
+# ---------------------------------------------------------------------------
 
-class DatabaseModel(BaseModel):
+
+class IndexInfo(BaseModel):
+    """Composite or single-column index."""
+
+    model_config = _SHARED_CONFIG
+
+    name: str = Field(..., min_length=1, description="Index name.")
+    columns: List[str] = Field(
+        ..., min_length=1, description="Ordered list of column names."
+    )
+    unique: bool = Field(default=False, description="UNIQUE index?")
+    index_type: IndexType = Field(
+        default=IndexType.BTREE, description="Index method."
+    )
+    condition: Optional[str] = Field(
+        default=None, description="Partial index WHERE clause."
+    )
+
+    @field_validator("columns")
+    @classmethod
+    def _no_duplicate_columns(cls, v: List[str]) -> List[str]:
+        if len(v) != len(set(v)):
+            raise ValueError(f"Duplicate columns in index: {v}")
+        return v
+
+
+class UniqueConstraintInfo(BaseModel):
+    """Multi-column unique constraint."""
+
+    model_config = _SHARED_CONFIG
+
+    name: Optional[str] = Field(default=None, description="Constraint name.")
+    columns: List[str] = Field(
+        ..., min_length=1, description="Columns in the unique group."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Table
+# ---------------------------------------------------------------------------
+
+
+class TableInfo(BaseModel):
     """
-    Complete database model definition.
-    
-    Holds all information needed to generate:
-    - SQLAlchemy ORM model class
-    - Pydantic request/response schemas
-    - CRUD operation functions
-    - Router endpoint handlers
+    Complete representation of a single database table / entity.
+
+    This is the central model consumed by the code generator.  One
+    ``TableInfo`` instance drives creation of: SQLAlchemy ORM model,
+    Pydantic schema(s), CRUD router, Alembic migration stub, and tests.
     """
-    
-    # Identity
-    name: str = Field(..., min_length=2, max_length=64)
-    description: Optional[str] = Field(default=None, max_length=500)
-    
-    # Field collections
-    fields: List[ModelField] = Field(default_factory=list)
-    relationships: List[Relationship] = Field(default_factory=list)
-    indexes: List[ModelIndex] = Field(default_factory=list)
-    
-    # Options
-    table_name: Optional[str] = Field(default=None)
-    timestamps: bool = Field(default=True)
-    soft_delete: bool = Field(default=False)
-    is_auth_model: bool = Field(default=False)
-    
-    model_config = {"arbitrary_types_allowed": True}
-    
-    def model_post_init(self, __context: Any) -> None:
-        """Auto-inject standard fields based on configuration."""
-        existing_names: Set[str] = {f.name for f in self.fields}
-        
-        # Primary key
-        if "id" not in existing_names:
-            self.fields.insert(0, ModelField(
-                name="id",
-                field_type=FieldType.INTEGER,
-                primary_key=True,
-                auto_increment=True,
-                required=False,
-                description="Primary key",
-            ))
-            logger.debug("Auto-injected 'id' field into '%s'", self.name)
-        
-        # Timestamps
-        if self.timestamps:
-            if "created_at" not in existing_names:
-                self.fields.append(ModelField(
-                    name="created_at",
-                    field_type=FieldType.DATETIME,
-                    required=False,
-                    nullable=True,
-                    server_default="now()",
-                    description="Record creation timestamp",
-                ))
-            if "updated_at" not in existing_names:
-                self.fields.append(ModelField(
-                    name="updated_at",
-                    field_type=FieldType.DATETIME,
-                    required=False,
-                    nullable=True,
-                    server_default="now()",
-                    description="Record update timestamp",
-                ))
-        
-        # Soft delete
-        if self.soft_delete:
-            if "deleted_at" not in existing_names:
-                self.fields.append(ModelField(
-                    name="deleted_at",
-                    field_type=FieldType.DATETIME,
-                    required=False,
-                    nullable=True,
-                    description="Soft delete timestamp",
-                ))
-            if "is_deleted" not in existing_names:
-                self.fields.append(ModelField(
-                    name="is_deleted",
-                    field_type=FieldType.BOOLEAN,
-                    required=False,
-                    default=False,
-                    description="Soft delete flag",
-                ))
-        
-        # Auth model fields
-        if self.is_auth_model:
-            self._inject_auth_fields(existing_names)
-        
-        logger.debug(
-            "Model '%s' initialized: %d fields, %d relationships",
-            self.name, len(self.fields), len(self.relationships),
-        )
-    
-    def _inject_auth_fields(self, existing_names: Set[str]) -> None:
-        """Inject authentication-related fields."""
-        auth_fields = [
-            ModelField(
-                name="email",
-                field_type=FieldType.EMAIL,
-                unique=True,
-                indexed=True,
-                description="User email address",
-            ),
-            ModelField(
-                name="hashed_password",
-                field_type=FieldType.PASSWORD,
-                description="Bcrypt hashed password",
-            ),
-            ModelField(
-                name="is_active",
-                field_type=FieldType.BOOLEAN,
-                default=True,
-                description="Account active flag",
-            ),
-            ModelField(
-                name="is_superuser",
-                field_type=FieldType.BOOLEAN,
-                default=False,
-                description="Superuser privilege flag",
-            ),
-            ModelField(
-                name="last_login",
-                field_type=FieldType.DATETIME,
-                nullable=True,
-                required=False,
-                description="Last login timestamp",
-            ),
+
+    model_config = _SHARED_CONFIG
+
+    name: str = Field(..., min_length=1, description="Table name (snake_case).")
+    schema_name: Optional[str] = Field(
+        default=None, description="Database schema (e.g. 'public')."
+    )
+    columns: List[ColumnInfo] = Field(
+        ..., min_length=1, description="Columns (at least one required)."
+    )
+    primary_key_columns: List[str] = Field(
+        default_factory=list,
+        description="Explicit PK column names (auto-detected if empty).",
+    )
+    foreign_keys: List[ForeignKeyInfo] = Field(
+        default_factory=list, description="Foreign key references."
+    )
+    relationships: List[RelationshipInfo] = Field(
+        default_factory=list, description="ORM relationships."
+    )
+    indexes: List[IndexInfo] = Field(
+        default_factory=list, description="Indexes."
+    )
+    unique_constraints: List[UniqueConstraintInfo] = Field(
+        default_factory=list, description="Multi-column unique constraints."
+    )
+    comment: Optional[str] = Field(default=None, description="Table comment / doc.")
+    extend_existing: bool = Field(
+        default=True, description="SQLAlchemy __table_args__ extend_existing."
+    )
+
+    # -- Computed helpers ---------------------------------------------------
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def class_name(self) -> str:
+        """PascalCase class name derived from table name (O(n) on name length)."""
+        return "".join(part.capitalize() for part in self.name.split("_"))
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def resolved_primary_keys(self) -> List[str]:
+        """Return PK column names — explicit list or auto-detect from ColumnInfo."""
+        if self.primary_key_columns:
+            return self.primary_key_columns
+        return [c.name for c in self.columns if c.primary_key]
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def has_composite_pk(self) -> bool:
+        return len(self.resolved_primary_keys) > 1
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def column_names(self) -> List[str]:
+        return [c.name for c in self.columns]
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def nullable_columns(self) -> List[str]:
+        return [c.name for c in self.columns if c.nullable and not c.primary_key]
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def required_columns(self) -> List[str]:
+        return [
+            c.name
+            for c in self.columns
+            if (not c.nullable or c.primary_key) and not c.autoincrement
         ]
-        for af in auth_fields:
-            if af.name not in existing_names:
-                self.fields.append(af)
-                logger.debug("Auto-injected auth field '%s'", af.name)
-    
-    # ---- Computed Properties ----
-    
-    @property
-    def get_table_name(self) -> str:
-        """Derive database table name."""
-        if self.table_name:
-            return self.table_name
-        return pluralize(to_snake_case(self.name))
-    
-    @property
-    def user_fields(self) -> List[ModelField]:
-        """Get user-defined fields (excludes auto-generated)."""
-        return [f for f in self.fields if f.name not in AUTO_FIELD_NAMES]
-    
-    @property
-    def required_fields(self) -> List[ModelField]:
-        """Get required fields for creation."""
-        return [f for f in self.user_fields if f.required and f.default is None]
-    
-    @property
-    def searchable_fields(self) -> List[ModelField]:
-        """Get fields suitable for text search."""
-        return [f for f in self.user_fields if f.field_type in SEARCHABLE_FIELD_TYPES]
-    
-    @property
-    def unique_fields(self) -> List[ModelField]:
-        """Get fields with unique constraints."""
-        return [f for f in self.fields if f.unique]
-    
-    @property
-    def indexed_fields(self) -> List[ModelField]:
-        """Get explicitly indexed fields."""
-        return [f for f in self.fields if f.indexed]
-    
-    # ---- SQLAlchemy Generation ----
-    
-    def generate_sqlalchemy_model(self) -> str:
-        """Generate complete SQLAlchemy ORM model class."""
-        lines: List[str] = []
-        
-        lines.append(f"class {self.name}(Base):")
-        if self.description:
-            lines.append(f'    """{self.description}"""')
-        lines.append(f'    __tablename__ = "{self.get_table_name}"')
-        lines.append("")
-        
-        for f in self.fields:
-            if f.description:
-                lines.append(f"    # {f.description}")
-            lines.append(f"    {f.name} = {f.to_sqlalchemy()}")
-        lines.append("")
-        
-        for rel in self.relationships:
-            fk = rel.to_sqlalchemy_foreign_key()
-            if fk:
-                lines.append(fk)
-            lines.append(rel.to_sqlalchemy_relationship())
-        
-        if self.relationships:
-            lines.append("")
-        
-        if self.indexes:
-            idx_strs = [idx.to_sqlalchemy(self.get_table_name) for idx in self.indexes]
-            lines.append("    __table_args__ = (")
-            for idx_str in idx_strs:
-                lines.append(f"        {idx_str},")
-            lines.append("    )")
-            lines.append("")
-        
-        repr_fields = self.user_fields[:3]
-        if repr_fields:
-            repr_parts = ", ".join(f"{f.name}={{self.{f.name}}}" for f in repr_fields)
-            lines.append("    def __repr__(self) -> str:")
-            lines.append(f'        return f"<{self.name}({repr_parts})>"')
-        
-        return "\n".join(lines)
-    
-    # ---- Pydantic Schema Generation ----
-    
-    def generate_pydantic_schemas(self) -> str:
-        """Generate all Pydantic schemas."""
-        lines: List[str] = []
-        user_fields = self.user_fields
-        hidden_fields: Set[str] = {"hashed_password"}
-        
-        # Base Schema
-        lines.append(f"class {self.name}Base(BaseModel):")
-        if self.description:
-            lines.append(f'    """{self.description} — base schema."""')
-        
-        schema_fields = [f for f in user_fields if f.name not in hidden_fields]
-        if schema_fields:
-            for f in schema_fields:
-                lines.append(f.to_pydantic())
-        else:
-            lines.append("    pass")
-        lines.append("")
-        
-        # Validators
-        all_validators: List[str] = []
-        for f in schema_fields:
-            all_validators.extend(f.generate_validators())
-        if all_validators:
-            for v in all_validators:
-                lines.append(v)
-            lines.append("")
-        
-        # Create Schema
-        lines.append(f"class {self.name}Create({self.name}Base):")
-        lines.append(f'    """Schema for creating a new {self.name}."""')
-        if self.is_auth_model:
-            lines.append("    password: str")
-        else:
-            lines.append("    pass")
-        lines.append("")
-        
-        # Update Schema
-        lines.append(f"class {self.name}Update(BaseModel):")
-        lines.append(f'    """Schema for updating {self.name}."""')
-        for f in schema_fields:
-            lines.append(f.to_pydantic_update())
-        if self.is_auth_model:
-            lines.append("    password: Optional[str] = None")
-        lines.append("")
-        
-        # InDB Schema
-        lines.append(f"class {self.name}InDB({self.name}Base):")
-        lines.append(f'    """Schema for {self.name} from database."""')
-        lines.append("    id: int")
-        if self.timestamps:
-            lines.append("    created_at: Optional[datetime] = None")
-            lines.append("    updated_at: Optional[datetime] = None")
-        if self.soft_delete:
-            lines.append("    deleted_at: Optional[datetime] = None")
-            lines.append("    is_deleted: bool = False")
-        lines.append("")
-        lines.append("    class Config:")
-        lines.append("        from_attributes = True")
-        lines.append("")
-        
-        # Response Schema
-        lines.append(f"class {self.name}Response({self.name}InDB):")
-        lines.append(f'    """API response schema for {self.name}."""')
-        lines.append("    pass")
-        
-        return "\n".join(lines)
-    
-    def generate_association_tables(self) -> str:
-        """Generate all M2M association Table() definitions."""
-        tables: List[str] = []
-        for rel in self.relationships:
-            table = rel.generate_association_table()
-            if table:
-                tables.append(table)
-        return "\n\n".join(tables)
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Serialize model to dictionary."""
-        return {
-            "name": self.name,
-            "description": self.description,
-            "table_name": self.get_table_name,
-            "fields": [f.to_dict() for f in self.fields],
-            "relationships": [r.to_dict() for r in self.relationships],
-            "timestamps": self.timestamps,
-            "soft_delete": self.soft_delete,
-            "is_auth_model": self.is_auth_model,
-        }
 
+    @computed_field  # type: ignore[misc]
+    @property
+    def fk_column_names(self) -> FrozenSet[str]:
+        return frozenset(fk.constrained_column for fk in self.foreign_keys)
 
-# ============================================================
-# FLUENT MODEL BUILDER
-# ============================================================
+    @field_serializer("fk_column_names")
+    def _serialize_fk_column_names(self, v: FrozenSet[str], _info: Any) -> List[str]:
+        return sorted(v)
 
-class ModelBuilder:
-    """
-    Fluent builder for constructing DatabaseModel instances.
-    All relationship methods automatically set source_model.
-    """
-    
-    def __init__(self, name: str, description: str = "") -> None:
-        self._name: str = name
-        self._description: str = description
-        self._fields: List[ModelField] = []
-        self._relationships: List[Relationship] = []
-        self._indexes: List[ModelIndex] = []
-        self._timestamps: bool = True
-        self._soft_delete: bool = False
-        self._is_auth_model: bool = False
-        self._table_name: Optional[str] = None
-        
-        logger.debug("ModelBuilder created for '%s'", name)
-    
-    # ---- Generic Field ----
-    
-    def add_field(
-        self,
-        name: str,
-        field_type: Union[FieldType, str],
-        required: bool = True,
-        unique: bool = False,
-        indexed: bool = False,
-        nullable: bool = False,
-        default: Optional[Any] = None,
-        max_length: int = 255,
-        description: Optional[str] = None,
-        enum_values: Optional[List[str]] = None,
-        constraint: Optional[FieldConstraint] = None,
-        foreign_key: Optional[str] = None,
-    ) -> "ModelBuilder":
-        """Add a generic field."""
-        resolved_type = resolve_field_type(field_type)
-        self._fields.append(ModelField(
-            name=name,
-            field_type=resolved_type,
-            required=required,
-            unique=unique,
-            indexed=indexed,
-            nullable=nullable,
-            default=default,
-            max_length=max_length,
-            description=description,
-            enum_values=enum_values,
-            constraint=constraint,
-            foreign_key=foreign_key,
-        ))
-        return self
-    
-    # ---- Typed Shortcuts ----
-    
-    def add_string(self, name: str, max_length: int = 255, **kwargs: Any) -> "ModelBuilder":
-        return self.add_field(name, FieldType.STRING, max_length=max_length, **kwargs)
-    
-    def add_text(self, name: str, **kwargs: Any) -> "ModelBuilder":
-        return self.add_field(name, FieldType.TEXT, **kwargs)
-    
-    def add_integer(self, name: str, **kwargs: Any) -> "ModelBuilder":
-        return self.add_field(name, FieldType.INTEGER, **kwargs)
-    
-    def add_float(self, name: str, **kwargs: Any) -> "ModelBuilder":
-        return self.add_field(name, FieldType.FLOAT, **kwargs)
-    
-    def add_boolean(self, name: str, default: bool = False, **kwargs: Any) -> "ModelBuilder":
-        return self.add_field(name, FieldType.BOOLEAN, default=default, **kwargs)
-    
-    def add_datetime(self, name: str, **kwargs: Any) -> "ModelBuilder":
-        return self.add_field(name, FieldType.DATETIME, **kwargs)
-    
-    def add_date(self, name: str, **kwargs: Any) -> "ModelBuilder":
-        return self.add_field(name, FieldType.DATE, **kwargs)
-    
-    def add_email(self, name: str = "email", **kwargs: Any) -> "ModelBuilder":
-        return self.add_field(name, FieldType.EMAIL, max_length=320, **kwargs)
-    
-    def add_url(self, name: str, **kwargs: Any) -> "ModelBuilder":
-        return self.add_field(name, FieldType.URL, max_length=2048, **kwargs)
-    
-    def add_json(self, name: str, **kwargs: Any) -> "ModelBuilder":
-        return self.add_field(name, FieldType.JSON, **kwargs)
-    
-    def add_enum(self, name: str, values: List[str], default: Optional[str] = None, **kwargs: Any) -> "ModelBuilder":
-        return self.add_field(name, FieldType.ENUM, enum_values=values, default=default, **kwargs)
-    
-    def add_slug(self, name: str = "slug", **kwargs: Any) -> "ModelBuilder":
-        kwargs.setdefault("unique", True)
-        kwargs.setdefault("indexed", True)
-        return self.add_field(name, FieldType.SLUG, **kwargs)
-    
-    def add_file(self, name: str, **kwargs: Any) -> "ModelBuilder":
-        return self.add_field(name, FieldType.FILE, max_length=512, **kwargs)
-    
-    def add_image(self, name: str, **kwargs: Any) -> "ModelBuilder":
-        return self.add_field(name, FieldType.IMAGE, max_length=512, **kwargs)
-    
-    def add_password(self, name: str = "hashed_password", **kwargs: Any) -> "ModelBuilder":
-        return self.add_field(name, FieldType.PASSWORD, **kwargs)
-    
-    def add_phone(self, name: str, **kwargs: Any) -> "ModelBuilder":
-        return self.add_field(name, FieldType.PHONE, max_length=20, **kwargs)
-    
-    def add_uuid(self, name: str, **kwargs: Any) -> "ModelBuilder":
-        return self.add_field(name, FieldType.UUID, **kwargs)
-    
-    def add_decimal(self, name: str, **kwargs: Any) -> "ModelBuilder":
-        return self.add_field(name, FieldType.DECIMAL, **kwargs)
-    
-    # ---- Relationships (all set source_model) ----
-    
-    def belongs_to(
-        self,
-        name: str,
-        target: str,
-        back_populates: Optional[str] = None,
-        on_delete: OnDelete = OnDelete.CASCADE,
-        foreign_key: Optional[str] = None,
-    ) -> "ModelBuilder":
-        """Add a many-to-one relationship."""
-        self._relationships.append(Relationship(
-            name=name,
-            target_model=target,
-            relation_type=RelationType.MANY_TO_ONE,
-            source_model=self._name,
-            back_populates=back_populates,
-            on_delete=on_delete,
-            foreign_key=foreign_key,
-        ))
-        return self
-    
-    def has_many(
-        self,
-        name: str,
-        target: str,
-        back_populates: Optional[str] = None,
-        on_delete: OnDelete = OnDelete.CASCADE,
-    ) -> "ModelBuilder":
-        """Add a one-to-many relationship."""
-        self._relationships.append(Relationship(
-            name=name,
-            target_model=target,
-            relation_type=RelationType.ONE_TO_MANY,
-            source_model=self._name,
-            back_populates=back_populates,
-            on_delete=on_delete,
-        ))
-        return self
-    
-    def has_one(
-        self,
-        name: str,
-        target: str,
-        back_populates: Optional[str] = None,
-        on_delete: OnDelete = OnDelete.CASCADE,
-    ) -> "ModelBuilder":
-        """Add a one-to-one relationship."""
-        self._relationships.append(Relationship(
-            name=name,
-            target_model=target,
-            relation_type=RelationType.ONE_TO_ONE,
-            source_model=self._name,
-            back_populates=back_populates,
-            on_delete=on_delete,
-        ))
-        return self
-    
-    def many_to_many(
-        self,
-        name: str,
-        target: str,
-        back_populates: Optional[str] = None,
-        on_delete: OnDelete = OnDelete.CASCADE,
-        association_table: Optional[str] = None,
-    ) -> "ModelBuilder":
-        """Add a many-to-many relationship."""
-        self._relationships.append(Relationship(
-            name=name,
-            target_model=target,
-            relation_type=RelationType.MANY_TO_MANY,
-            source_model=self._name,
-            back_populates=back_populates,
-            on_delete=on_delete,
-            association_table=association_table,
-        ))
-        return self
-    
-    # ---- Configuration ----
-    
-    def with_timestamps(self, enabled: bool = True) -> "ModelBuilder":
-        self._timestamps = enabled
-        return self
-    
-    def with_soft_delete(self, enabled: bool = True) -> "ModelBuilder":
-        self._soft_delete = enabled
-        return self
-    
-    def with_table_name(self, table_name: str) -> "ModelBuilder":
-        self._table_name = table_name
-        return self
-    
-    def as_auth_model(self) -> "ModelBuilder":
-        self._is_auth_model = True
-        return self
-    
-    # ---- Indexes ----
-    
-    def add_index(
-        self,
-        fields: List[str],
-        index_type: IndexType = IndexType.NORMAL,
-        name: Optional[str] = None,
-    ) -> "ModelBuilder":
-        idx_name = name or f"idx_{self._name.lower()}_{'_'.join(fields)}"
-        self._indexes.append(ModelIndex(
-            name=idx_name,
-            fields=fields,
-            index_type=index_type,
-        ))
-        return self
-    
-    def add_unique_index(self, fields: List[str], name: Optional[str] = None) -> "ModelBuilder":
-        return self.add_index(fields, IndexType.UNIQUE, name)
-    
-    # ---- Build ----
-    
-    def build(self) -> DatabaseModel:
-        """Build the final DatabaseModel."""
-        model = DatabaseModel(
-            name=self._name,
-            description=self._description,
-            fields=self._fields,
-            relationships=self._relationships,
-            indexes=self._indexes,
-            table_name=self._table_name,
-            timestamps=self._timestamps,
-            soft_delete=self._soft_delete,
-            is_auth_model=self._is_auth_model,
+    # -- Fast O(1) lookup cache (populated once via model_validator) --------
+    _column_map: Dict[str, ColumnInfo] = {}
+
+    @model_validator(mode="after")
+    def _build_column_map(self) -> "TableInfo":
+        object.__setattr__(
+            self,
+            "_column_map",
+            {c.name: c for c in self.columns},
         )
-        
-        logger.info(
-            "Built model '%s': %d fields, %d relationships",
-            model.name, len(model.fields), len(model.relationships),
+        return self
+
+    def get_column(self, name: str) -> Optional[ColumnInfo]:
+        """O(1) column lookup by name."""
+        return self._column_map.get(name)
+
+    @model_validator(mode="after")
+    def _auto_detect_pks(self) -> "TableInfo":
+        if not self.resolved_primary_keys:
+            logger.warning(
+                "Table '%s' has no primary key columns defined or detected. "
+                "Code generation may produce invalid models.",
+                self.name,
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_fk_columns_exist(self) -> "TableInfo":
+        col_set: Set[str] = {c.name for c in self.columns}
+        for fk in self.foreign_keys:
+            if fk.constrained_column not in col_set:
+                raise ValueError(
+                    f"ForeignKey references column '{fk.constrained_column}' "
+                    f"which does not exist in table '{self.name}'. "
+                    f"Available columns: {sorted(col_set)}"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_index_columns_exist(self) -> "TableInfo":
+        col_set: Set[str] = {c.name for c in self.columns}
+        for idx in self.indexes:
+            missing: List[str] = [c for c in idx.columns if c not in col_set]
+            if missing:
+                raise ValueError(
+                    f"Index '{idx.name}' on table '{self.name}' references "
+                    f"non-existent columns: {missing}"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_unique_columns_exist(self) -> "TableInfo":
+        col_set: Set[str] = {c.name for c in self.columns}
+        for uc in self.unique_constraints:
+            missing: List[str] = [c for c in uc.columns if c not in col_set]
+            if missing:
+                raise ValueError(
+                    f"UniqueConstraint on table '{self.name}' references "
+                    f"non-existent columns: {missing}"
+                )
+        return self
+
+    def __repr__(self) -> str:
+        return (
+            f"<Table {self.name} "
+            f"({len(self.columns)} cols, {len(self.foreign_keys)} FKs, "
+            f"{len(self.relationships)} rels)>"
         )
-        
-        return model
 
 
-# ============================================================
-# PRESET MODEL FACTORIES
-# ============================================================
+# ---------------------------------------------------------------------------
+# Code Generation Configuration
+# ---------------------------------------------------------------------------
 
-def create_user_model() -> DatabaseModel:
-    """Create standard User model with auth."""
-    return (
-        ModelBuilder("User", "Application user")
-        .add_string("username", max_length=50, unique=True, indexed=True)
-        .add_string("full_name", max_length=100, required=False, nullable=True)
-        .as_auth_model()
-        .with_timestamps()
-        .with_soft_delete()
-        .build()
+
+class CRUDConfig(BaseModel):
+    """Per-table CRUD endpoint toggle."""
+
+    model_config = _SHARED_CONFIG
+
+    create: bool = Field(default=True, description="Generate POST endpoint.")
+    read_one: bool = Field(default=True, description="Generate GET /:id endpoint.")
+    read_many: bool = Field(default=True, description="Generate GET / (list) endpoint.")
+    update: bool = Field(default=True, description="Generate PUT/PATCH endpoint.")
+    delete: bool = Field(default=True, description="Generate DELETE endpoint.")
+    bulk_create: bool = Field(default=False, description="Generate bulk POST endpoint.")
+    bulk_delete: bool = Field(default=False, description="Generate bulk DELETE endpoint.")
+    search: bool = Field(default=True, description="Generate search/filter endpoint.")
+    export_csv: bool = Field(default=False, description="Generate CSV export endpoint.")
+
+
+class GenerationConfig(BaseModel):
+    """
+    Master configuration that controls every aspect of code generation.
+
+    A single instance of this model (combined with a ``SchemaDefinition``)
+    is all the generator needs to produce the full output.
+    """
+
+    model_config = _SHARED_CONFIG
+
+    # -- Project metadata ---------------------------------------------------
+    project_name: str = Field(
+        default="myproject",
+        min_length=1,
+        max_length=128,
+        description="Project / package name.",
+    )
+    project_version: str = Field(
+        default="0.1.0", description="Semantic version string."
+    )
+    project_description: str = Field(
+        default="Auto-generated FastAPI application.",
+        description="Short description for pyproject.toml / OpenAPI.",
+    )
+    author: str = Field(default="NexaFlow APIGen", description="Author name.")
+
+    # -- Database -----------------------------------------------------------
+    database_dialect: DatabaseDialect = Field(
+        default=DatabaseDialect.POSTGRESQL,
+        description="Target database backend.",
+    )
+    database_url: str = Field(
+        default="postgresql+asyncpg://user:pass@localhost:5432/mydb",
+        description="SQLAlchemy connection URL (async driver recommended).",
+    )
+    use_async: bool = Field(
+        default=True, description="Generate async SQLAlchemy engine + sessions."
     )
 
-
-def create_post_model(author_model: str = "User") -> DatabaseModel:
-    """Create standard Post model."""
-    return (
-        ModelBuilder("Post", "Blog post")
-        .add_string("title", max_length=200)
-        .add_slug("slug")
-        .add_text("content")
-        .add_text("excerpt", required=False, nullable=True)
-        .add_enum("status", ["draft", "published", "archived"], default="draft")
-        .add_integer("view_count", default=0, required=False)
-        .add_datetime("published_at", required=False, nullable=True)
-        .belongs_to("author", author_model, back_populates="posts")
-        .with_timestamps()
-        .build()
+    # -- Code style ---------------------------------------------------------
+    naming_convention: NamingConvention = Field(
+        default=NamingConvention.SNAKE_CASE,
+        description="Naming style for generated identifiers.",
+    )
+    line_length: int = Field(
+        default=99, ge=40, le=200, description="Black / Ruff line length."
+    )
+    indent_size: int = Field(
+        default=4, ge=2, le=8, description="Indentation width."
+    )
+    generate_docstrings: bool = Field(
+        default=True, description="Add docstrings to generated classes."
+    )
+    generate_type_hints: bool = Field(
+        default=True, description="Add type hints everywhere."
     )
 
-
-def create_tag_model(taggable_model: str = "Post") -> DatabaseModel:
-    """Create Tag model with M2M relationship."""
-    return (
-        ModelBuilder("Tag", "Content tag")
-        .add_string("name", max_length=50, unique=True)
-        .add_slug("slug")
-        .add_string("color", max_length=7, required=False, nullable=True)
-        .many_to_many("posts", taggable_model, back_populates="tags")
-        .with_timestamps()
-        .build()
+    # -- Features -----------------------------------------------------------
+    generate_alembic: bool = Field(
+        default=True, description="Generate Alembic migration setup."
     )
+    generate_tests: bool = Field(
+        default=True, description="Generate pytest test stubs."
+    )
+    generate_docker: bool = Field(
+        default=False, description="Generate Dockerfile + docker-compose."
+    )
+    generate_crud_schemas: bool = Field(
+        default=True, description="Generate Pydantic CRUD schemas per table."
+    )
+    generate_repository_layer: bool = Field(
+        default=True,
+        description="Generate a repository/DAO layer abstracting raw ORM calls.",
+    )
+
+    # -- API ----------------------------------------------------------------
+    auth_strategy: AuthStrategy = Field(
+        default=AuthStrategy.JWT, description="Authentication strategy."
+    )
+    pagination_style: PaginationStyle = Field(
+        default=PaginationStyle.OFFSET, description="List endpoint pagination."
+    )
+    default_page_size: int = Field(
+        default=25, ge=1, le=1000, description="Default items per page."
+    )
+    max_page_size: int = Field(
+        default=100, ge=1, le=10000, description="Maximum items per page."
+    )
+    enable_cors: bool = Field(default=True, description="Add CORS middleware.")
+    cors_origins: List[str] = Field(
+        default_factory=lambda: ["*"],
+        description="Allowed CORS origins.",
+    )
+    enable_rate_limiting: bool = Field(
+        default=False, description="Add rate-limiting middleware."
+    )
+    rate_limit_per_minute: int = Field(
+        default=60, ge=1, description="Requests per minute when rate limiting is on."
+    )
+    api_prefix: str = Field(
+        default="/api/v1", description="Global API route prefix."
+    )
+    enable_websockets: bool = Field(
+        default=False, description="Generate WebSocket notification endpoints."
+    )
+
+    # -- CRUD toggles per table (override defaults) -------------------------
+    crud_overrides: Dict[str, CRUDConfig] = Field(
+        default_factory=dict,
+        description="Per-table CRUD toggles keyed by table name.",
+    )
+    default_crud: CRUDConfig = Field(
+        default_factory=CRUDConfig,
+        description="Default CRUD toggle applied when no override exists.",
+    )
+
+    # -- Output -------------------------------------------------------------
+    output_dir: str = Field(
+        default="./generated", description="Root directory for generated code."
+    )
+    overwrite_existing: bool = Field(
+        default=False,
+        description="Overwrite files if output_dir already contains code.",
+    )
+
+    # -- Helpers ------------------------------------------------------------
+
+    def get_crud_config(self, table_name: str) -> CRUDConfig:
+        """O(1) lookup for per-table CRUD config with fallback to default."""
+        return self.crud_overrides.get(table_name, self.default_crud)
+
+    @model_validator(mode="after")
+    def _validate_page_sizes(self) -> "GenerationConfig":
+        if self.default_page_size > self.max_page_size:
+            raise ValueError(
+                f"default_page_size ({self.default_page_size}) must be "
+                f"<= max_page_size ({self.max_page_size})."
+            )
+        return self
+
+
+# ---------------------------------------------------------------------------
+# Schema Definition — top-level container
+# ---------------------------------------------------------------------------
+
+
+class SchemaDefinition(BaseModel):
+    """
+    The root model: describes the **entire** database schema to be processed.
+
+    Invariant: ``table_map`` is an O(1) lookup cache built automatically
+    from the ``tables`` list upon construction.
+    """
+
+    model_config = _SHARED_CONFIG
+
+    tables: List[TableInfo] = Field(
+        ..., min_length=1, description="All tables in the schema."
+    )
+    enums: List[EnumDefinition] = Field(
+        default_factory=list, description="Standalone enum types."
+    )
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Arbitrary metadata (parsed from SQL comments, etc.).",
+    )
+    source_file: Optional[str] = Field(
+        default=None, description="Original schema file path."
+    )
+    parsed_at: Optional[datetime] = Field(
+        default=None, description="Timestamp when schema was parsed."
+    )
+
+    # -- Internal cache (not part of the serialised model) ------------------
+    _table_map: Dict[str, TableInfo] = {}
+
+    @model_validator(mode="after")
+    def _build_table_map(self) -> "SchemaDefinition":
+        object.__setattr__(
+            self,
+            "_table_map",
+            {t.name: t for t in self.tables},
+        )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_unique_table_names(self) -> "SchemaDefinition":
+        names: List[str] = [t.name for t in self.tables]
+        if len(names) != len(set(names)):
+            dupes: List[str] = [n for n in names if names.count(n) > 1]
+            raise ValueError(f"Duplicate table names: {sorted(set(dupes))}")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_fk_targets_exist(self) -> "SchemaDefinition":
+        table_names: Set[str] = {t.name for t in self.tables}
+        for table in self.tables:
+            for fk in table.foreign_keys:
+                if fk.referred_table not in table_names:
+                    raise ValueError(
+                        f"Table '{table.name}' has FK to '{fk.referred_table}' "
+                        f"which is not defined in the schema."
+                    )
+        return self
+
+    def get_table(self, name: str) -> Optional[TableInfo]:
+        """O(1) table lookup."""
+        return self._table_map.get(name)
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def table_count(self) -> int:
+        return len(self.tables)
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def total_columns(self) -> int:
+        return sum(len(t.columns) for t in self.tables)
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def total_relationships(self) -> int:
+        return sum(len(t.relationships) for t in self.tables)
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def table_names(self) -> List[str]:
+        return [t.name for t in self.tables]
+
+    def topological_order(self) -> List[str]:
+        """
+        Return table names in dependency order (tables with no FKs first).
+
+        Uses Kahn's algorithm — O(V + E) where V = tables, E = foreign keys.
+        This ensures that generated migration files are in correct order.
+        """
+        in_degree: Dict[str, int] = {t.name: 0 for t in self.tables}
+        adjacency: Dict[str, List[str]] = {t.name: [] for t in self.tables}
+
+        for table in self.tables:
+            for fk in table.foreign_keys:
+                if fk.referred_table != table.name:  # skip self-referential
+                    adjacency[fk.referred_table].append(table.name)
+                    in_degree[table.name] += 1
+
+        queue: List[str] = [n for n, d in in_degree.items() if d == 0]
+        result: List[str] = []
+
+        while queue:
+            node: str = queue.pop(0)
+            result.append(node)
+            for neighbour in adjacency[node]:
+                in_degree[neighbour] -= 1
+                if in_degree[neighbour] == 0:
+                    queue.append(neighbour)
+
+        if len(result) != len(self.tables):
+            logger.warning(
+                "Circular FK dependency detected — topological sort is partial. "
+                "Falling back to declaration order for remaining tables."
+            )
+            remaining: List[str] = [
+                t.name for t in self.tables if t.name not in set(result)
+            ]
+            result.extend(remaining)
+
+        return result
+
+    def __repr__(self) -> str:
+        return (
+            f"<SchemaDefinition {self.table_count} tables, "
+            f"{self.total_columns} columns, "
+            f"{self.total_relationships} relationships>"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Generation Result — output manifest
+# ---------------------------------------------------------------------------
+
+
+class GeneratedFile(BaseModel):
+    """Represents a single file produced by the code generator."""
+
+    model_config = _SHARED_CONFIG
+
+    path: str = Field(..., min_length=1, description="Relative file path.")
+    content: str = Field(..., description="Full file content.")
+    line_count: int = Field(default=0, ge=0, description="Number of lines.")
+    size_bytes: int = Field(default=0, ge=0, description="Content size in bytes.")
+    checksum: Optional[str] = Field(
+        default=None, description="SHA-256 hex digest of content."
+    )
+
+    @model_validator(mode="after")
+    def _compute_metrics(self) -> "GeneratedFile":
+        self.line_count = self.content.count("\n") + (1 if self.content else 0)
+        self.size_bytes = len(self.content.encode("utf-8"))
+        return self
+
+
+class GenerationResult(BaseModel):
+    """
+    Manifest returned by the generator after a full run.
+
+    Consumed by exporters to write files to disk and by CLI to print
+    summary statistics.
+    """
+
+    model_config = _SHARED_CONFIG
+
+    files: List[GeneratedFile] = Field(
+        default_factory=list, description="All generated files."
+    )
+    config: GenerationConfig = Field(
+        ..., description="Config used for this generation run."
+    )
+    schema_def: SchemaDefinition = Field(
+        ..., description="Schema that was processed."
+    )
+    started_at: datetime = Field(
+        default_factory=datetime.utcnow, description="Run start time."
+    )
+    finished_at: Optional[datetime] = Field(
+        default=None, description="Run finish time."
+    )
+    success: bool = Field(default=True, description="Overall success flag.")
+    errors: List[str] = Field(
+        default_factory=list, description="Non-fatal errors / warnings."
+    )
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def total_files(self) -> int:
+        return len(self.files)
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def total_lines(self) -> int:
+        return sum(f.line_count for f in self.files)
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def total_bytes(self) -> int:
+        return sum(f.size_bytes for f in self.files)
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def duration_seconds(self) -> Optional[float]:
+        if self.finished_at and self.started_at:
+            return (self.finished_at - self.started_at).total_seconds()
+        return None
+
+    def add_file(self, path: str, content: str) -> None:
+        """Append a generated file — O(1) amortised."""
+        self.files.append(GeneratedFile(path=path, content=content))
+
+    def __repr__(self) -> str:
+        return (
+            f"<GenerationResult {self.total_files} files, "
+            f"{self.total_lines} lines, "
+            f"{'OK' if self.success else 'FAILED'}>"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Module-level exports
+# ---------------------------------------------------------------------------
+
+__all__: List[str] = [
+    "ColumnType",
+    "RelationshipType",
+    "IndexType",
+    "OnDeleteAction",
+    "OnUpdateAction",
+    "AuthStrategy",
+    "PaginationStyle",
+    "NamingConvention",
+    "DatabaseDialect",
+    "ColumnConstraint",
+    "EnumDefinition",
+    "ColumnDefault",
+    "ColumnInfo",
+    "ForeignKeyInfo",
+    "RelationshipInfo",
+    "IndexInfo",
+    "UniqueConstraintInfo",
+    "TableInfo",
+    "CRUDConfig",
+    "GenerationConfig",
+    "SchemaDefinition",
+    "GeneratedFile",
+    "GenerationResult",
+]
+
+logger.debug("apigen.models loaded — %d public symbols.", len(__all__))
