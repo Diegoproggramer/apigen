@@ -1,498 +1,544 @@
+# File: apigen/cli.py
 """
-APIGen Command Line Interface
-Generate FastAPI backends from the terminal ⚡
+NexaFlow APIGen - Command-Line Interface
+==========================================
+
+Professional CLI built exclusively with the standard-library ``argparse``
+module — zero external dependencies.
+
+Usage examples::
+
+    # Basic generation
+    python -m apigen --schema schema.yaml --output ./my_api
+
+    # Verbose output with clean directory
+    python -m apigen -s schema.json -o ./output --verbose --clean
+
+    # Override project name and use async mode
+    python -m apigen -s schema.yaml -o ./out \\
+        --project-name "MyApp" --async --dialect postgresql
+
+    # Validate only (no file output)
+    python -m apigen -s schema.yaml --validate-only
+
+    # Show version
+    python -m apigen --version
+
+Exit codes:
+    0 — success
+    1 — validation error
+    2 — generation error
+    3 — export error
+    4 — input/argument error
 """
+
+from __future__ import annotations
 
 import argparse
-import json
+import logging
 import sys
-import os
-from typing import Dict, List
+import time
+from pathlib import Path
+from typing import Dict, List, NoReturn, Optional, Sequence
 
-from apigen.generator import APIGenerator, ProjectConfig
+# ---------------------------------------------------------------------------
+# Logger (configured in _setup_logging)
+# ---------------------------------------------------------------------------
+logger: logging.Logger = logging.getLogger("apigen")
 
 
-class CLI:
+# ---------------------------------------------------------------------------
+# Exit codes
+# ---------------------------------------------------------------------------
+
+EXIT_SUCCESS: int = 0
+EXIT_VALIDATION_ERROR: int = 1
+EXIT_GENERATION_ERROR: int = 2
+EXIT_EXPORT_ERROR: int = 3
+EXIT_INPUT_ERROR: int = 4
+
+
+# ---------------------------------------------------------------------------
+# Logging setup
+# ---------------------------------------------------------------------------
+
+
+def _setup_logging(verbosity: int) -> None:
     """
-    ⚡ APIGen Command Line Interface
-    
-    Usage:
-        python -m apigen init myproject
-        python -m apigen generate --config project.json
-        python -m apigen add-model User name:str email:str age:int
-        python -m apigen quickstart ecommerce
+    Configure the root apigen logger based on verbosity level.
+
+    Args:
+        verbosity: 0 = WARNING, 1 = INFO, 2+ = DEBUG.
     """
-    
-    def __init__(self):
-        self.parser = self._build_parser()
-    
-    def _build_parser(self) -> argparse.ArgumentParser:
-        """Build argument parser"""
-        parser = argparse.ArgumentParser(
-            prog="apigen",
-            description="⚡ APIGen - FastAPI Backend Generator",
-            formatter_class=argparse.RawDescriptionHelpFormatter,
-            epilog="""
-Examples:
-  apigen init myproject              Create new project config
-  apigen generate -c config.json     Generate from config file
-  apigen quickstart blog             Generate a blog backend instantly
-  apigen quickstart ecommerce        Generate an e-commerce backend
-  apigen quickstart social           Generate a social media backend
-            """
+    if verbosity >= 2:
+        level = logging.DEBUG
+    elif verbosity >= 1:
+        level = logging.INFO
+    else:
+        level = logging.WARNING
+
+    # Create a nice handler with colour-like formatting
+    handler: logging.StreamHandler = logging.StreamHandler(sys.stderr)
+    handler.setLevel(level)
+
+    fmt: str = "%(asctime)s │ %(levelname)-8s │ %(name)s │ %(message)s"
+    datefmt: str = "%H:%M:%S"
+    formatter: logging.Formatter = logging.Formatter(fmt, datefmt=datefmt)
+    handler.setFormatter(formatter)
+
+    # Configure the root apigen logger
+    root_logger: logging.Logger = logging.getLogger("apigen")
+    root_logger.setLevel(level)
+
+    # Remove existing handlers to prevent duplication
+    root_logger.handlers.clear()
+    root_logger.addHandler(handler)
+
+    # Prevent propagation to root logger
+    root_logger.propagate = False
+
+
+# ---------------------------------------------------------------------------
+# Argument parser
+# ---------------------------------------------------------------------------
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """Build and return the argument parser."""
+    from apigen import __version__
+
+    parser: argparse.ArgumentParser = argparse.ArgumentParser(
+        prog="apigen",
+        description=(
+            "NexaFlow APIGen — Automated REST API Code Generator.\n\n"
+            "Transforms database schema definitions (JSON/YAML) into "
+            "complete, production-ready FastAPI + SQLAlchemy 2.0 applications."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  %(prog)s -s schema.yaml -o ./my_api\n"
+            "  %(prog)s -s schema.json -o ./out --verbose --clean\n"
+            "  %(prog)s -s schema.yaml --validate-only\n"
+            "  %(prog)s -s schema.yaml -o ./out --async --dialect postgresql\n"
+        ),
+    )
+
+    # Version
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"NexaFlow APIGen v{__version__}",
+    )
+
+    # --- Required arguments ---
+    parser.add_argument(
+        "-s", "--schema",
+        type=str,
+        required=True,
+        metavar="PATH",
+        help="Path to the schema definition file (JSON or YAML).",
+    )
+
+    # --- Output ---
+    parser.add_argument(
+        "-o", "--output",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help=(
+            "Output directory for the generated project. "
+            "Required unless --validate-only is set."
+        ),
+    )
+
+    # --- Modes ---
+    mode_group = parser.add_argument_group("operation modes")
+    mode_group.add_argument(
+        "--validate-only",
+        action="store_true",
+        default=False,
+        help="Only validate the schema without generating code.",
+    )
+    mode_group.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help=(
+            "Run the full pipeline but don't write files to disk. "
+            "Useful for checking generation without side effects."
+        ),
+    )
+
+    # --- Config overrides ---
+    config_group = parser.add_argument_group("configuration overrides")
+    config_group.add_argument(
+        "--project-name",
+        type=str,
+        default=None,
+        metavar="NAME",
+        help="Override the project name.",
+    )
+    config_group.add_argument(
+        "--project-version",
+        type=str,
+        default=None,
+        metavar="VER",
+        help="Override the project version (e.g. '2.0.0').",
+    )
+    config_group.add_argument(
+        "--dialect",
+        type=str,
+        default=None,
+        choices=["postgresql", "mysql", "sqlite", "oracle", "mssql"],
+        help="Override the database dialect.",
+    )
+    config_group.add_argument(
+        "--database-url",
+        type=str,
+        default=None,
+        metavar="URL",
+        help="Override the database URL.",
+    )
+    config_group.add_argument(
+        "--async",
+        dest="use_async",
+        action="store_true",
+        default=None,
+        help="Force async mode (async engine + sessions).",
+    )
+    config_group.add_argument(
+        "--sync",
+        dest="use_sync",
+        action="store_true",
+        default=False,
+        help="Force sync mode.",
+    )
+    config_group.add_argument(
+        "--pagination",
+        type=str,
+        default=None,
+        choices=["offset", "page_number", "cursor"],
+        help="Override pagination style.",
+    )
+    config_group.add_argument(
+        "--api-prefix",
+        type=str,
+        default=None,
+        metavar="PREFIX",
+        help="Override API URL prefix (e.g. '/api/v1').",
+    )
+
+    # --- Behaviour flags ---
+    behaviour_group = parser.add_argument_group("behaviour flags")
+    behaviour_group.add_argument(
+        "--clean",
+        action="store_true",
+        default=False,
+        help="Clean output directory before generation.",
+    )
+    behaviour_group.add_argument(
+        "--strict",
+        action="store_true",
+        default=True,
+        help="Abort on any validation error (default).",
+    )
+    behaviour_group.add_argument(
+        "--no-strict",
+        action="store_true",
+        default=False,
+        help="Continue even if validation has errors (skip bad tables).",
+    )
+    behaviour_group.add_argument(
+        "--fail-on-warnings",
+        action="store_true",
+        default=False,
+        help="Treat validation warnings as errors.",
+    )
+    behaviour_group.add_argument(
+        "--no-project-files",
+        action="store_true",
+        default=False,
+        help="Skip generating project support files (pyproject.toml, etc.).",
+    )
+
+    # --- Verbosity ---
+    verbosity_group = parser.add_argument_group("verbosity")
+    verbosity_group.add_argument(
+        "-v", "--verbose",
+        action="count",
+        default=0,
+        help="Increase verbosity (-v for INFO, -vv for DEBUG).",
+    )
+    verbosity_group.add_argument(
+        "-q", "--quiet",
+        action="store_true",
+        default=False,
+        help="Suppress all output except errors.",
+    )
+
+    return parser
+
+
+# ---------------------------------------------------------------------------
+# Config override builder
+# ---------------------------------------------------------------------------
+
+
+def _build_config_overrides(args: argparse.Namespace) -> Dict[str, object]:
+    """Build a config override dictionary from CLI arguments."""
+    overrides: Dict[str, object] = {}
+
+    if args.project_name is not None:
+        overrides["project_name"] = args.project_name
+
+    if args.project_version is not None:
+        overrides["project_version"] = args.project_version
+
+    if args.dialect is not None:
+        overrides["database_dialect"] = args.dialect
+
+    if args.database_url is not None:
+        overrides["database_url"] = args.database_url
+
+    if args.use_async is True:
+        overrides["use_async"] = True
+    elif args.use_sync is True:
+        overrides["use_async"] = False
+
+    if args.pagination is not None:
+        overrides["pagination_style"] = args.pagination
+
+    if args.api_prefix is not None:
+        overrides["api_prefix"] = args.api_prefix
+
+    return overrides
+
+
+# ---------------------------------------------------------------------------
+# Validate-only mode
+# ---------------------------------------------------------------------------
+
+
+def _run_validate_only(schema_path: Path) -> int:
+    """
+    Run validation only (no code generation).
+
+    Returns the appropriate exit code.
+    """
+    from apigen.generator import load_schema_file, parse_raw_schema
+    from apigen.validators import validate_full
+
+    logger.info("Running validation-only mode for: %s", schema_path)
+
+    # Load
+    try:
+        raw_data = load_schema_file(schema_path)
+    except (FileNotFoundError, ValueError) as exc:
+        logger.error("Failed to load schema: %s", exc)
+        return EXIT_INPUT_ERROR
+
+    # Parse
+    try:
+        schema, config = parse_raw_schema(raw_data)
+    except ValueError as exc:
+        logger.error("Failed to parse schema: %s", exc)
+        return EXIT_INPUT_ERROR
+
+    # Validate
+    from apigen.utils import Timer
+
+    with Timer("validation") as t:
+        result = validate_full(schema, config)
+
+    # Report
+    print(f"\n{'='*50}")
+    print(f"  Schema Validation Report")
+    print(f"{'='*50}")
+    print(f"  File:     {schema_path.name}")
+    print(f"  Tables:   {len(schema.tables)}")
+    print(f"  Time:     {t.elapsed:.3f}s")
+    print(f"  Valid:    {'Yes' if result.is_valid else 'No'}")
+
+    if result.errors:
+        print(f"\n  Errors ({len(result.errors)}):")
+        for err in result.errors:
+            print(f"    ✗ {err}")
+
+    if result.warnings:
+        print(f"\n  Warnings ({len(result.warnings)}):")
+        for warn in result.warnings:
+            print(f"    ⚠ {warn}")
+
+    if result.is_valid and not result.warnings:
+        print(f"\n  ✅ All validations passed!")
+
+    print(f"{'='*50}\n")
+
+    return EXIT_SUCCESS if result.is_valid else EXIT_VALIDATION_ERROR
+
+
+# ---------------------------------------------------------------------------
+# Full generation mode
+# ---------------------------------------------------------------------------
+
+
+def _run_generation(
+    schema_path: Path,
+    output_dir: Path,
+    args: argparse.Namespace,
+) -> int:
+    """
+    Run the full generation pipeline.
+
+    Returns the appropriate exit code.
+    """
+    from apigen.generator import APIGenerator, GenerationReport
+
+    config_overrides = _build_config_overrides(args)
+
+    strict: bool = not args.no_strict
+    generator: APIGenerator = APIGenerator(
+        strict_validation=strict,
+        fail_on_warnings=args.fail_on_warnings,
+        skip_invalid_tables=not strict,
+        clean_output=args.clean,
+    )
+
+    if args.dry_run:
+        logger.info("Dry-run mode: files will not be written to disk.")
+
+    report: GenerationReport = generator.generate_from_file(
+        schema_path=schema_path,
+        output_dir=output_dir,
+        config_overrides=config_overrides if config_overrides else None,
+    )
+
+    # Print the summary report
+    print(report.summary())
+
+    # Determine exit code
+    if not report.success:
+        if report.validation_errors:
+            return EXIT_VALIDATION_ERROR
+        elif report.generation_errors:
+            return EXIT_GENERATION_ERROR
+        elif report.export_errors:
+            return EXIT_EXPORT_ERROR
+        return EXIT_GENERATION_ERROR
+
+    return EXIT_SUCCESS
+
+
+# ---------------------------------------------------------------------------
+# Banner
+# ---------------------------------------------------------------------------
+
+
+def _print_banner() -> None:
+    """Print the NexaFlow banner."""
+    banner: str = r"""
+    ╔═══════════════════════════════════════════════════╗
+    ║                                                   ║
+    ║    ███╗   ██╗███████╗██╗  ██╗ █████╗             ║
+    ║    ████╗  ██║██╔════╝╚██╗██╔╝██╔══██╗            ║
+    ║    ██╔██╗ ██║█████╗   ╚███╔╝ ███████║            ║
+    ║    ██║╚██╗██║██╔══╝   ██╔██╗ ██╔══██║            ║
+    ║    ██║ ╚████║███████╗██╔╝ ██╗██║  ██║            ║
+    ║    ╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝            ║
+    ║                                                   ║
+    ║    APIGen — Code Generation Engine                ║
+    ║                                                   ║
+    ╚═══════════════════════════════════════════════════╝
+    """
+    print(banner, file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+
+def cli_main(argv: Optional[Sequence[str]] = None) -> NoReturn:
+    """
+    Main CLI entry point.
+
+    Can be called from ``__main__.py`` or directly for testing.
+
+    Args:
+        argv: Optional argument list (defaults to sys.argv[1:]).
+    """
+    parser: argparse.ArgumentParser = _build_parser()
+    args: argparse.Namespace = parser.parse_args(argv)
+
+    # --- Verbosity ---
+    if args.quiet:
+        verbosity: int = -1
+        logging.disable(logging.CRITICAL)
+    else:
+        verbosity = args.verbose
+
+    _setup_logging(verbosity)
+
+    # --- Banner (only if verbose enough) ---
+    if verbosity >= 1:
+        _print_banner()
+
+    # --- Schema path ---
+    schema_path: Path = Path(args.schema).resolve()
+
+    if not schema_path.exists():
+        logger.error("Schema file not found: %s", schema_path)
+        sys.exit(EXIT_INPUT_ERROR)
+
+    if not schema_path.is_file():
+        logger.error("Schema path is not a file: %s", schema_path)
+        sys.exit(EXIT_INPUT_ERROR)
+
+    # --- Validate-only mode ---
+    if args.validate_only:
+        exit_code: int = _run_validate_only(schema_path)
+        sys.exit(exit_code)
+
+    # --- Output directory validation ---
+    if args.output is None:
+        logger.error(
+            "Output directory is required for generation. "
+            "Use -o/--output or --validate-only."
         )
-        
-        subparsers = parser.add_subparsers(dest="command", help="Available commands")
-        
-        # INIT command
-        init_parser = subparsers.add_parser("init", help="Initialize new project config")
-        init_parser.add_argument("name", help="Project name")
-        init_parser.add_argument("--output", "-o", default="./output", help="Output directory")
-        init_parser.add_argument("--db", default="sqlite:///./app.db", help="Database URL")
-        init_parser.add_argument("--no-auth", action="store_true", help="Disable authentication")
-        init_parser.add_argument("--no-docker", action="store_true", help="Disable Docker files")
-        
-        # GENERATE command
-        gen_parser = subparsers.add_parser("generate", help="Generate project from config")
-        gen_parser.add_argument("--config", "-c", required=True, help="Config JSON file path")
-        gen_parser.add_argument("--output", "-o", default="./output", help="Output directory")
-        
-        # ADD-MODEL command
-        model_parser = subparsers.add_parser("add-model", help="Add model to config")
-        model_parser.add_argument("name", help="Model name (e.g., User)")
-        model_parser.add_argument("fields", nargs="+", help="Fields as name:type (e.g., email:str age:int)")
-        model_parser.add_argument("--config", "-c", default="apigen_config.json", help="Config file")
-        
-        # QUICKSTART command
-        quick_parser = subparsers.add_parser("quickstart", help="Generate from preset template")
-        quick_parser.add_argument("template", choices=["blog", "ecommerce", "social", "todo", "saas"],
-                                  help="Project template")
-        quick_parser.add_argument("--name", "-n", help="Custom project name")
-        quick_parser.add_argument("--output", "-o", default="./output", help="Output directory")
-        
-        # INFO command
-        subparsers.add_parser("info", help="Show APIGen information")
-        
-        return parser
-    
-    def run(self, args=None):
-        """Run CLI with given arguments"""
-        parsed = self.parser.parse_args(args)
-        
-        if not parsed.command:
-            self._print_banner()
-            self.parser.print_help()
-            return
-        
-        commands = {
-            "init": self._cmd_init,
-            "generate": self._cmd_generate,
-            "add-model": self._cmd_add_model,
-            "quickstart": self._cmd_quickstart,
-            "info": self._cmd_info,
-        }
-        
-        handler = commands.get(parsed.command)
-        if handler:
-            handler(parsed)
-        else:
-            self.parser.print_help()
-    
-    def _cmd_init(self, args):
-        """Handle init command"""
-        self._print_banner()
-        print(f"📁 Initializing project: {args.name}\n")
-        
-        config = {
-            "name": args.name,
-            "description": f"{args.name} API - Generated by APIGen",
-            "version": "0.1.0",
-            "database_url": args.db,
-            "auth_enabled": not args.no_auth,
-            "cors_enabled": True,
-            "docker_enabled": not args.no_docker,
-            "models": [],
-            "output_dir": args.output
-        }
-        
-        config_file = "apigen_config.json"
-        with open(config_file, 'w') as f:
-            json.dump(config, f, indent=2)
-        
-        print(f"  ✅ Config created: {config_file}")
-        print(f"\n📝 Next steps:")
-        print(f"  1. Edit {config_file} to add your models")
-        print(f"  2. Run: apigen generate -c {config_file}")
-        print(f"\n  Or use quickstart: apigen quickstart blog")
-    
-    def _cmd_generate(self, args):
-        """Handle generate command"""
-        self._print_banner()
-        
-        if not os.path.exists(args.config):
-            print(f"  ❌ Config file not found: {args.config}")
-            sys.exit(1)
-        
-        with open(args.config) as f:
-            config = json.load(f)
-        
-        print(f"📄 Loading config: {args.config}")
-        
-        generator = APIGenerator(
-            project_name=config["name"],
-            output_dir=args.output
-        )
-        
-        # Configure
-        if config.get("database_url"):
-            generator.set_database(config["database_url"])
-        generator.enable_auth(config.get("auth_enabled", True))
-        generator.enable_cors(config.get("cors_enabled", True))
-        generator.enable_docker(config.get("docker_enabled", True))
-        
-        # Add models
-        for model_data in config.get("models", []):
-            generator.add_model(
-                name=model_data["name"],
-                fields=model_data["fields"],
-                relationships=model_data.get("relationships", []),
-                timestamps=model_data.get("timestamps", True)
-            )
-        
-        # Generate!
-        result = generator.generate()
-        
-        print(f"\n🎉 Your API is ready!")
-        print(f"   cd {result['output_dir']}")
-        print(f"   pip install -r requirements.txt")
-        print(f"   uvicorn main:app --reload")
-    
-    def _cmd_add_model(self, args):
-        """Handle add-model command"""
-        # Parse fields
-        fields = {}
-        for field_str in args.fields:
-            if ":" not in field_str:
-                print(f"  ❌ Invalid field format: {field_str} (use name:type)")
-                sys.exit(1)
-            name, ftype = field_str.split(":", 1)
-            fields[name] = ftype
-        
-        # Load or create config
-        config_file = args.config
-        if os.path.exists(config_file):
-            with open(config_file) as f:
-                config = json.load(f)
-        else:
-            print(f"  ❌ Config file not found: {config_file}")
-            print(f"  Run 'apigen init <project_name>' first")
-            sys.exit(1)
-        
-        # Add model
-        model = {
-            "name": args.name,
-            "fields": fields,
-            "timestamps": True
-        }
-        config.setdefault("models", []).append(model)
-        
-        with open(config_file, 'w') as f:
-            json.dump(config, f, indent=2)
-        
-        print(f"  ✅ Model '{args.name}' added with {len(fields)} fields")
-        print(f"  📝 Fields: {', '.join(f'{k}:{v}' for k, v in fields.items())}")
-    
-    def _cmd_quickstart(self, args):
-        """Handle quickstart command - generate from preset templates"""
-        self._print_banner()
-        
-        templates = QuickStartTemplates()
-        template_func = getattr(templates, f"template_{args.template}", None)
-        
-        if not template_func:
-            print(f"  ❌ Unknown template: {args.template}")
-            sys.exit(1)
-        
-        project_name = args.name or args.template
-        print(f"⚡ QuickStart: Generating '{args.template}' project as '{project_name}'\n")
-        
-        generator = template_func(project_name, args.output)
-        result = generator.generate()
-        
-        print(f"\n🎉 Your {args.template} API is ready!")
-        print(f"   cd {result['output_dir']}")
-        print(f"   pip install -r requirements.txt")
-        print(f"   uvicorn main:app --reload")
-        print(f"   Open http://localhost:8000/docs")
-    
-    def _cmd_info(self, args):
-        """Handle info command"""
-        self._print_banner()
-        print("  Version:  0.1.0")
-        print("  Author:   APIGen Team")
-        print("  License:  MIT")
-        print("  GitHub:   https://github.com/Diegoproggramer/apigen")
-        print()
-        print("  Templates: blog, ecommerce, social, todo, saas")
-        print("  Features:  CRUD, Auth, Docker, Pagination, Schemas")
-    
-    def _print_banner(self):
-        """Print APIGen banner"""
-        banner = """
-    ╔═══════════════════════════════════════════╗
-    ║     ⚡ APIGen - FastAPI Generator ⚡      ║
-    ║     Generate backends in seconds          ║
-    ╚═══════════════════════════════════════════╝
-        """
-        print(banner)
+        parser.print_usage(sys.stderr)
+        sys.exit(EXIT_INPUT_ERROR)
+
+    output_dir: Path = Path(args.output).resolve()
+
+    # Log key parameters
+    logger.info("Schema:  %s", schema_path)
+    logger.info("Output:  %s", output_dir)
+    logger.info("Clean:   %s", args.clean)
+    logger.info("Strict:  %s", not args.no_strict)
+
+    # --- Run generation ---
+    exit_code = _run_generation(schema_path, output_dir, args)
+
+    if exit_code == EXIT_SUCCESS:
+        logger.info("Generation completed successfully.")
+    else:
+        logger.error("Generation failed with exit code %d.", exit_code)
+
+    sys.exit(exit_code)
 
 
-class QuickStartTemplates:
-    """
-    🚀 Pre-built project templates for instant backend generation
-    """
-    
-    def template_blog(self, name: str, output: str) -> APIGenerator:
-        """Blog/CMS backend template"""
-        gen = APIGenerator(name, output)
-        
-        gen.add_model("User", {
-            "username": "str",
-            "email": "str",
-            "bio": "text",
-            "is_active": "bool"
-        })
-        
-        gen.add_model("Post", {
-            "title": "str",
-            "content": "text",
-            "slug": "str",
-            "published": "bool",
-            "author_id": "int"
-        })
-        
-        gen.add_model("Comment", {
-            "content": "text",
-            "author_id": "int",
-            "post_id": "int"
-        })
-        
-        gen.add_model("Category", {
-            "name": "str",
-            "slug": "str",
-            "description": "text"
-        })
-        
-        gen.add_model("Tag", {
-            "name": "str",
-            "slug": "str"
-        })
-        
-        return gen
-    
-    def template_ecommerce(self, name: str, output: str) -> APIGenerator:
-        """E-commerce backend template"""
-        gen = APIGenerator(name, output)
-        
-        gen.add_model("User", {
-            "email": "str",
-            "username": "str",
-            "phone": "str",
-            "address": "text",
-            "is_active": "bool"
-        })
-        
-        gen.add_model("Product", {
-            "name": "str",
-            "description": "text",
-            "price": "float",
-            "stock": "int",
-            "sku": "str",
-            "category_id": "int",
-            "is_active": "bool"
-        })
-        
-        gen.add_model("Category", {
-            "name": "str",
-            "slug": "str",
-            "description": "text",
-            "parent_id": "int"
-        })
-        
-        gen.add_model("Order", {
-            "user_id": "int",
-            "total_amount": "float",
-            "status": "str",
-            "shipping_address": "text",
-            "payment_method": "str"
-        })
-        
-        gen.add_model("OrderItem", {
-            "order_id": "int",
-            "product_id": "int",
-            "quantity": "int",
-            "unit_price": "float"
-        })
-        
-        gen.add_model("Review", {
-            "user_id": "int",
-            "product_id": "int",
-            "rating": "int",
-            "comment": "text"
-        })
-        
-        gen.add_model("Coupon", {
-            "code": "str",
-            "discount_percent": "float",
-            "max_uses": "int",
-            "is_active": "bool"
-        })
-        
-        return gen
-    
-    def template_social(self, name: str, output: str) -> APIGenerator:
-        """Social media backend template"""
-        gen = APIGenerator(name, output)
-        
-        gen.add_model("User", {
-            "username": "str",
-            "email": "str",
-            "display_name": "str",
-            "bio": "text",
-            "avatar_url": "str",
-            "is_verified": "bool"
-        })
-        
-        gen.add_model("Post", {
-            "content": "text",
-            "author_id": "int",
-            "media_url": "str",
-            "likes_count": "int",
-            "is_public": "bool"
-        })
-        
-        gen.add_model("Comment", {
-            "content": "text",
-            "author_id": "int",
-            "post_id": "int",
-            "likes_count": "int"
-        })
-        
-        gen.add_model("Follow", {
-            "follower_id": "int",
-            "following_id": "int"
-        })
-        
-        gen.add_model("Message", {
-            "sender_id": "int",
-            "receiver_id": "int",
-            "content": "text",
-            "is_read": "bool"
-        })
-        
-        gen.add_model("Notification", {
-            "user_id": "int",
-            "type": "str",
-            "content": "text",
-            "is_read": "bool",
-            "link": "str"
-        })
-        
-        return gen
-    
-    def template_todo(self, name: str, output: str) -> APIGenerator:
-        """Todo/Task management backend template"""
-        gen = APIGenerator(name, output)
-        
-        gen.add_model("User", {
-            "email": "str",
-            "username": "str",
-            "is_active": "bool"
-        })
-        
-        gen.add_model("Project", {
-            "name": "str",
-            "description": "text",
-            "owner_id": "int",
-            "is_archived": "bool"
-        })
-        
-        gen.add_model("Task", {
-            "title": "str",
-            "description": "text",
-            "project_id": "int",
-            "assignee_id": "int",
-            "status": "str",
-            "priority": "str",
-            "due_date": "datetime"
-        })
-        
-        gen.add_model("Label", {
-            "name": "str",
-            "color": "str",
-            "project_id": "int"
-        })
-        
-        return gen
-    
-    def template_saas(self, name: str, output: str) -> APIGenerator:
-        """SaaS platform backend template"""
-        gen = APIGenerator(name, output)
-        
-        gen.add_model("Organization", {
-            "name": "str",
-            "slug": "str",
-            "plan": "str",
-            "is_active": "bool"
-        })
-        
-        gen.add_model("User", {
-            "email": "str",
-            "username": "str",
-            "role": "str",
-            "org_id": "int",
-            "is_active": "bool"
-        })
-        
-        gen.add_model("Subscription", {
-            "org_id": "int",
-            "plan_name": "str",
-            "price": "float",
-            "status": "str",
-            "billing_cycle": "str"
-        })
-        
-        gen.add_model("Invoice", {
-            "org_id": "int",
-            "amount": "float",
-            "status": "str",
-            "description": "text"
-        })
-        
-        gen.add_model("APIKey", {
-            "user_id": "int",
-            "key_hash": "str",
-            "name": "str",
-            "is_active": "bool",
-            "last_used": "datetime"
-        })
-        
-        gen.add_model("AuditLog", {
-            "user_id": "int",
-            "action": "str",
-            "resource": "str",
-            "details": "text",
-            "ip_address": "str"
-        })
-        
-        return gen
+# ---------------------------------------------------------------------------
+# Module-level exports
+# ---------------------------------------------------------------------------
 
+__all__: List[str] = [
+    "cli_main",
+    "EXIT_SUCCESS",
+    "EXIT_VALIDATION_ERROR",
+    "EXIT_GENERATION_ERROR",
+    "EXIT_EXPORT_ERROR",
+    "EXIT_INPUT_ERROR",
+]
 
-def main():
-    """Entry point for CLI"""
-    cli = CLI()
-    cli.run()
-
-
-if __name__ == "__main__":
-    main()
+logger.debug("apigen.cli loaded.")
