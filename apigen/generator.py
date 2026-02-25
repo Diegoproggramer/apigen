@@ -1,1787 +1,819 @@
 # File: apigen/generator.py
 """
-APIGen Core Generator Engine
-The brain that generates complete FastAPI backends automatically
+NexaFlow APIGen - Master Generation Pipeline (Orchestrator)
+==============================================================
 
-REFACTORED VERSION:
-- Phase 1: Unified with enterprise model system from models.py
-- Phase 2: Fixed TemplateEngine method indentation
+This is the **brain** of NexaFlow.  It connects every phase together:
+
+    Schema Input → Validation → Template Generation → File Export
+
+The ``APIGenerator`` class provides both a programmatic API and the
+backend for the CLI.
+
+Workflow::
+
+    1. Load schema from JSON/YAML file (or accept in-memory objects).
+    2. Parse into ``SchemaDefinition`` + ``GenerationConfig`` (models.py).
+    3. Run full validation pipeline (validators.py).
+    4. Compute topological order of tables (models.py).
+    5. Feed each table to ``TemplateGenerator`` (templates.py).
+    6. Collect all generated file strings.
+    7. Hand off to ``ProjectExporter`` (exporters.py).
+    8. Return a ``GenerationReport`` with metrics and status.
+
+Error handling strategy:
+    - Validation errors are collected and surfaced, not swallowed.
+    - Generation errors per-table are isolated — one bad table doesn't
+      crash the entire pipeline.
+    - Export errors are recorded in the manifest.
+    - The final report gives a clear pass/fail verdict.
+
+Complexity: O(T × (C + R)) where T = tables, C = columns, R = relationships.
 """
 
-import os
+from __future__ import annotations
+
 import json
-from typing import Dict, List, Optional, Any, Union
+import logging
+import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
-# =============================================================================
-# PHASE 1: Import enterprise-grade model system from models.py
-# This replaces the simple DatabaseModel that was previously defined here
-# =============================================================================
+from apigen.exporters import ExportManifest, ExportResult, ProjectExporter
 from apigen.models import (
-    DatabaseModel,
-    ModelField,
-    FieldType,
-    Relationship,
-    RelationType,
-    FieldConstraint,
-    IndexType,
-    OnDelete
+    GenerationConfig,
+    SchemaDefinition,
+    TableInfo,
 )
+from apigen.templates import TemplateGenerator
+from apigen.utils import Timer, count_lines, to_snake_case
+from apigen.validators import ValidationResult, validate_full
+
+# ---------------------------------------------------------------------------
+# Logger
+# ---------------------------------------------------------------------------
+logger: logging.Logger = logging.getLogger("apigen.generator")
 
 
-@dataclass
-class APIEndpoint:
-    """Represents a single API endpoint"""
-    path: str
-    method: str  # GET, POST, PUT, DELETE
-    name: str
-    description: str
-    request_body: Optional[Dict] = None
-    response_model: Optional[Dict] = None
-    auth_required: bool = False
-    tags: List[str] = field(default_factory=list)
+# ---------------------------------------------------------------------------
+# Generation report
+# ---------------------------------------------------------------------------
 
 
-# NOTE: DatabaseModel dataclass REMOVED from here - now imported from apigen.models
+@dataclass(frozen=False, slots=True)
+class GenerationStepMetric:
+    """Timing and outcome for a single pipeline step."""
+
+    step_name: str = ""
+    success: bool = True
+    elapsed_seconds: float = 0.0
+    detail: str = ""
 
 
-@dataclass
-class ProjectConfig:
-    """Complete project configuration"""
-    name: str
-    description: str
-    version: str = "0.1.0"
-    database_url: str = "sqlite:///./app.db"
-    auth_enabled: bool = True
-    cors_enabled: bool = True
-    docker_enabled: bool = True
-    models: List[DatabaseModel] = field(default_factory=list)
-    endpoints: List[APIEndpoint] = field(default_factory=list)
-    created_at: str = field(default_factory=lambda: datetime.now().isoformat())
+@dataclass(frozen=False, slots=True)
+class GenerationReport:
+    """
+    Comprehensive report produced by ``APIGenerator.generate()``.
+
+    Contains timing information, file counts, validation results,
+    and any errors/warnings encountered.
+    """
+
+    success: bool = False
+    project_name: str = ""
+    output_directory: str = ""
+
+    # Metrics
+    total_files: int = 0
+    total_bytes: int = 0
+    total_lines: int = 0
+    total_tables_processed: int = 0
+    total_elapsed_seconds: float = 0.0
+
+    # Sub-reports
+    step_metrics: List[GenerationStepMetric] = field(default_factory=list)
+    validation_errors: List[str] = field(default_factory=list)
+    validation_warnings: List[str] = field(default_factory=list)
+    generation_errors: List[str] = field(default_factory=list)
+    export_errors: List[str] = field(default_factory=list)
+    skipped_tables: List[str] = field(default_factory=list)
+
+    # Export manifest reference
+    manifest: Optional[ExportManifest] = None
+
+    def summary(self) -> str:
+        """Return a human-readable summary string."""
+        lines: List[str] = []
+        status: str = "✅ SUCCESS" if self.success else "❌ FAILED"
+        lines.append(f"{'='*60}")
+        lines.append(f"  NexaFlow APIGen — Generation Report")
+        lines.append(f"{'='*60}")
+        lines.append(f"  Status:           {status}")
+        lines.append(f"  Project:          {self.project_name}")
+        lines.append(f"  Output:           {self.output_directory}")
+        lines.append(f"  Tables processed: {self.total_tables_processed}")
+        lines.append(f"  Files generated:  {self.total_files}")
+        lines.append(f"  Total lines:      {self.total_lines:,}")
+        lines.append(f"  Total bytes:      {self.total_bytes:,}")
+        lines.append(
+            f"  Total time:       {self.total_elapsed_seconds:.3f}s"
+        )
+        lines.append(f"{'─'*60}")
+
+        if self.step_metrics:
+            lines.append("  Pipeline Steps:")
+            for step in self.step_metrics:
+                icon: str = "✓" if step.success else "✗"
+                lines.append(
+                    f"    {icon} {step.step_name:<28s} "
+                    f"{step.elapsed_seconds:>7.3f}s  "
+                    f"{step.detail}"
+                )
+
+        if self.validation_errors:
+            lines.append(f"{'─'*60}")
+            lines.append(f"  Validation Errors ({len(self.validation_errors)}):")
+            for err in self.validation_errors:
+                lines.append(f"    ✗ {err}")
+
+        if self.validation_warnings:
+            lines.append(f"{'─'*60}")
+            lines.append(
+                f"  Validation Warnings ({len(self.validation_warnings)}):"
+            )
+            for warn in self.validation_warnings:
+                lines.append(f"    ⚠ {warn}")
+
+        if self.generation_errors:
+            lines.append(f"{'─'*60}")
+            lines.append(
+                f"  Generation Errors ({len(self.generation_errors)}):"
+            )
+            for err in self.generation_errors:
+                lines.append(f"    ✗ {err}")
+
+        if self.export_errors:
+            lines.append(f"{'─'*60}")
+            lines.append(
+                f"  Export Errors ({len(self.export_errors)}):"
+            )
+            for err in self.export_errors:
+                lines.append(f"    ✗ {err}")
+
+        if self.skipped_tables:
+            lines.append(f"{'─'*60}")
+            lines.append(
+                f"  Skipped Tables ({len(self.skipped_tables)}):"
+            )
+            for tbl in self.skipped_tables:
+                lines.append(f"    ⊘ {tbl}")
+
+        lines.append(f"{'='*60}")
+        return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Schema loader helpers
+# ---------------------------------------------------------------------------
+
+
+def _load_json_file(path: Path) -> Dict[str, Any]:
+    """Load and parse a JSON file. Raises ValueError on parse errors."""
+    try:
+        text: str = path.read_text(encoding="utf-8")
+        data: Any = json.loads(text)
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"Expected a JSON object at top level, got {type(data).__name__}."
+            )
+        return data
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Invalid JSON in {path}: {exc}"
+        ) from exc
+
+
+def _load_yaml_file(path: Path) -> Dict[str, Any]:
+    """
+    Load and parse a YAML file.
+
+    Falls back to JSON parsing if PyYAML is not installed, but only
+    for files that happen to be valid JSON.
+    """
+    try:
+        import yaml
+    except ImportError:
+        logger.warning(
+            "PyYAML not installed. Attempting JSON parse for %s.", path
+        )
+        return _load_json_file(path)
+
+    try:
+        text: str = path.read_text(encoding="utf-8")
+        data: Any = yaml.safe_load(text)
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"Expected a YAML mapping at top level, got {type(data).__name__}."
+            )
+        return data
+    except yaml.YAMLError as exc:
+        raise ValueError(
+            f"Invalid YAML in {path}: {exc}"
+        ) from exc
+
+
+def load_schema_file(path: Path) -> Dict[str, Any]:
+    """
+    Load a schema definition file (JSON or YAML).
+
+    Dispatches based on file extension.
+
+    Args:
+        path: Path to the schema file.
+
+    Returns:
+        Parsed dictionary.
+
+    Raises:
+        FileNotFoundError: If the file doesn't exist.
+        ValueError: If the file can't be parsed.
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"Schema file not found: {path}")
+
+    if not path.is_file():
+        raise ValueError(f"Schema path is not a file: {path}")
+
+    suffix: str = path.suffix.lower()
+
+    if suffix in (".yaml", ".yml"):
+        return _load_yaml_file(path)
+    elif suffix == ".json":
+        return _load_json_file(path)
+    else:
+        # Try JSON first, then YAML
+        logger.info(
+            "Unknown extension '%s' — trying JSON then YAML.", suffix
+        )
+        try:
+            return _load_json_file(path)
+        except ValueError:
+            return _load_yaml_file(path)
+
+
+def parse_raw_schema(raw: Dict[str, Any]) -> Tuple[SchemaDefinition, GenerationConfig]:
+    """
+    Parse a raw dictionary (from JSON/YAML) into validated Pydantic models.
+
+    Expected top-level keys:
+        - "schema" or "tables": the schema definition
+        - "config" or "generation_config": the generation settings
+
+    Returns:
+        Tuple of (SchemaDefinition, GenerationConfig).
+
+    Raises:
+        ValueError: If required keys are missing or validation fails.
+    """
+    # --- Extract schema data ---
+    schema_data: Optional[Dict[str, Any]] = None
+    for key in ("schema", "tables", "schema_definition"):
+        if key in raw:
+            val = raw[key]
+            if key == "tables" and isinstance(val, list):
+                # Wrap bare table list into schema dict
+                schema_data = {"tables": val}
+            elif isinstance(val, dict):
+                schema_data = val
+            break
+
+    if schema_data is None:
+        # Maybe the entire dict IS the schema
+        if "tables" in raw:
+            schema_data = raw
+        else:
+            raise ValueError(
+                "Cannot find schema definition in input. "
+                "Expected top-level key: 'schema', 'tables', or 'schema_definition'."
+            )
+
+    # --- Extract config data ---
+    config_data: Optional[Dict[str, Any]] = None
+    for key in ("config", "generation_config", "generator_config"):
+        if key in raw:
+            config_data = raw[key]
+            break
+
+    if config_data is None:
+        # Use defaults
+        logger.info(
+            "No generation config found in input — using defaults."
+        )
+        config_data = {}
+
+    # --- Parse through Pydantic ---
+    try:
+        schema: SchemaDefinition = SchemaDefinition.model_validate(schema_data)
+    except Exception as exc:
+        raise ValueError(
+            f"Schema validation failed: {exc}"
+        ) from exc
+
+    try:
+        config: GenerationConfig = GenerationConfig.model_validate(config_data)
+    except Exception as exc:
+        raise ValueError(
+            f"Config validation failed: {exc}"
+        ) from exc
+
+    return schema, config
+
+
+# ---------------------------------------------------------------------------
+# APIGenerator — Master orchestrator
+# ---------------------------------------------------------------------------
 
 
 class APIGenerator:
     """
-    🚀 Main API Generator Engine
+    Master pipeline orchestrator for NexaFlow code generation.
 
-    Generates complete FastAPI backends from simple configurations.
-    Now uses the enterprise-grade model system from models.py.
+    Usage::
 
-    Usage (Simple - Dict-based, backward compatible):
-        generator = APIGenerator("my_project")
-        generator.add_model("User", {"name": "str", "email": "str"})
-        generator.generate()
+        generator = APIGenerator()
 
-    Usage (Advanced - ModelField-based):
-        generator = APIGenerator("my_project")
-        generator.add_model_advanced(DatabaseModel(
-            name="User",
-            fields=[
-                ModelField(name="email", field_type=FieldType.EMAIL, unique=True),
-                ModelField(name="username", field_type=FieldType.STRING, max_length=50),
-            ],
-            is_auth_model=True
-        ))
-        generator.generate()
+        # From a file
+        report = generator.generate_from_file(
+            schema_path=Path("schema.yaml"),
+            output_dir=Path("./output"),
+        )
+
+        # From in-memory objects
+        report = generator.generate(
+            schema=schema_def,
+            config=gen_config,
+            output_dir=Path("./output"),
+        )
+
+        print(report.summary())
+
+    The generator is reusable — create once, call generate() many times.
     """
 
-    # ==========================================================================
-    # PHASE 1: Type mapping for simple dict-based model creation (adapter)
-    # Maps simple string types to the enterprise FieldType enum
-    # ==========================================================================
-    SIMPLE_TYPE_MAP: Dict[str, FieldType] = {
-        "str": FieldType.STRING,
-        "string": FieldType.STRING,
-        "int": FieldType.INTEGER,
-        "integer": FieldType.INTEGER,
-        "float": FieldType.FLOAT,
-        "bool": FieldType.BOOLEAN,
-        "boolean": FieldType.BOOLEAN,
-        "text": FieldType.TEXT,
-        "datetime": FieldType.DATETIME,
-        "date": FieldType.DATE,
-        "email": FieldType.EMAIL,
-        "url": FieldType.URL,
-        "uuid": FieldType.UUID,
-        "json": FieldType.JSON,
-        "file": FieldType.FILE,
-        "image": FieldType.IMAGE,
-        "password": FieldType.PASSWORD,
-        "phone": FieldType.PHONE,
-        "slug": FieldType.SLUG,
-        "ip": FieldType.IP_ADDRESS,
-        "ip_address": FieldType.IP_ADDRESS,
-    }
-
-    def __init__(self, project_name: str, output_dir: str = "./output"):
-        self.config = ProjectConfig(
-            name=project_name,
-            description=f"{project_name} - Generated by APIGen"
-        )
-        self.output_dir = os.path.join(output_dir, project_name)
-        self.generated_files: List[str] = []
-        self._template_engine = TemplateEngine()
-
-        print(f"⚡ APIGen initialized for project: {project_name}")
-
-    # ==========================================================================
-    # PHASE 1: Adapter method - bridges simple Dict API to ModelField system
-    # ==========================================================================
-    def _convert_dict_to_model_fields(self, fields: Dict[str, str]) -> List[ModelField]:
-        """
-        Convert simple Dict[str, str] field definitions to List[ModelField].
-        This is the bridge between the simple API and enterprise model system.
-
-        Args:
-            fields: Dict mapping field names to type strings (e.g., {"email": "str"})
-
-        Returns:
-            List of ModelField objects with proper FieldType enums
-        """
-        model_fields = []
-        for field_name, field_type_str in fields.items():
-            # Normalize the type string
-            field_type_lower = field_type_str.lower().strip()
-
-            # Map to FieldType enum, default to STRING if unknown
-            field_type = self.SIMPLE_TYPE_MAP.get(field_type_lower, FieldType.STRING)
-
-            # Apply intelligent defaults based on field name patterns
-            is_unique = field_name.lower() in ("email", "username", "slug", "uuid")
-            is_indexed = field_name.lower() in (
-                "email", "username", "slug", "status", "type", "category", "user_id"
-            )
-
-            # Determine max_length based on field type
-            if field_type == FieldType.EMAIL:
-                max_length = 320
-            elif field_type == FieldType.URL:
-                max_length = 2048
-            elif field_type == FieldType.TEXT:
-                max_length = 65535
-            elif field_type == FieldType.PASSWORD:
-                max_length = 128
-            else:
-                max_length = 255
-
-            model_field = ModelField(
-                name=field_name,
-                field_type=field_type,
-                required=True,
-                unique=is_unique,
-                indexed=is_indexed,
-                nullable=False,
-                max_length=max_length,
-                description=f"{field_name} field"
-            )
-            model_fields.append(model_field)
-
-        return model_fields
-
-    def add_model(
+    def __init__(
         self,
-        name: str,
-        fields: Dict[str, str],
-        relationships: List[str] = None,
-        timestamps: bool = True
-    ) -> 'APIGenerator':
+        *,
+        strict_validation: bool = True,
+        fail_on_warnings: bool = False,
+        skip_invalid_tables: bool = True,
+        clean_output: bool = False,
+    ) -> None:
         """
-        Add a database model using simple Dict[str, str] syntax.
-        This is the convenience method for quick prototyping.
-        Maintains FULL backward compatibility with the original API.
+        Initialise the generator.
 
         Args:
-            name: Model name (e.g., "User", "Product")
-            fields: Dict mapping field names to types (e.g., {"email": "str", "age": "int"})
-            relationships: List of relationship names (deprecated, use add_model_advanced)
-            timestamps: Whether to include created_at/updated_at
-
-        Returns:
-            Self for method chaining
+            strict_validation: If True, abort on any validation error.
+            fail_on_warnings: If True, treat validation warnings as errors.
+            skip_invalid_tables: If True, skip tables that fail validation
+                                 individually (only in non-strict mode).
+            clean_output: If True, wipe the output directory before writing.
         """
-        # PHASE 1: Convert simple dict to ModelField objects using adapter
-        model_fields = self._convert_dict_to_model_fields(fields)
+        self._strict_validation: bool = strict_validation
+        self._fail_on_warnings: bool = fail_on_warnings
+        self._skip_invalid_tables: bool = skip_invalid_tables
+        self._clean_output: bool = clean_output
 
-        # Create the enterprise DatabaseModel from models.py
-        model = DatabaseModel(
-            name=name,
-            fields=model_fields,
-            relationships=[],  # Relationships handled via add_relationship()
-            timestamps=timestamps,
-            description=f"{name} model - auto-generated by APIGen"
+        logger.debug(
+            "APIGenerator initialised: strict=%s, fail_on_warnings=%s, "
+            "skip_invalid=%s, clean=%s.",
+            strict_validation,
+            fail_on_warnings,
+            skip_invalid_tables,
+            clean_output,
         )
 
-        self.config.models.append(model)
+    # -----------------------------------------------------------------
+    # Public: generate from file
+    # -----------------------------------------------------------------
 
-        # Auto-generate CRUD endpoints for this model
-        self._auto_generate_endpoints(model)
-
-        # Count user fields (excluding auto-generated id, timestamps)
-        user_field_count = len(model.user_fields)
-        print(f"  📦 Model added: {name} ({user_field_count} user fields)")
-        return self  # Enable method chaining
-
-    # ==========================================================================
-    # PHASE 1: New advanced method for direct DatabaseModel usage
-    # ==========================================================================
-    def add_model_advanced(self, model: DatabaseModel) -> 'APIGenerator':
-        """
-        Add a pre-configured DatabaseModel directly.
-        Use this for full control over field types, constraints, and relationships.
-
-        Args:
-            model: A complete DatabaseModel instance from models.py
-
-        Returns:
-            Self for method chaining
-
-        Example:
-            generator.add_model_advanced(DatabaseModel(
-                name="User",
-                fields=[
-                    ModelField(name="email", field_type=FieldType.EMAIL, unique=True),
-                    ModelField(name="age", field_type=FieldType.INTEGER, constraint=FieldConstraint(min_value=0, max_value=150)),
-                ],
-                is_auth_model=True,
-                soft_delete=True
-            ))
-        """
-        self.config.models.append(model)
-        self._auto_generate_endpoints(model)
-
-        user_field_count = len(model.user_fields)
-        print(f"  📦 Model added (advanced): {model.name} ({user_field_count} user fields)")
-        return self
-
-    # ==========================================================================
-    # PHASE 1: New relationship method using enterprise Relationship class
-    # ==========================================================================
-    def add_relationship(
+    def generate_from_file(
         self,
-        source_model: str,
-        target_model: str,
-        relation_type: RelationType,
-        back_populates: Optional[str] = None,
-        on_delete: OnDelete = OnDelete.CASCADE
-    ) -> 'APIGenerator':
+        schema_path: Path,
+        output_dir: Path,
+        *,
+        config_overrides: Optional[Dict[str, Any]] = None,
+    ) -> GenerationReport:
         """
-        Add a relationship between two models.
+        Full pipeline: load file → validate → generate → export.
 
         Args:
-            source_model: Name of the source model (must already be added)
-            target_model: Name of the target model
-            relation_type: Type of relationship (ONE_TO_MANY, MANY_TO_ONE, etc.)
-            back_populates: Name of reverse relationship on target model
-            on_delete: Action when parent is deleted (CASCADE, SET_NULL, etc.)
+            schema_path: Path to JSON/YAML schema file.
+            output_dir: Output directory for generated project.
+            config_overrides: Optional dict to override config values.
 
         Returns:
-            Self for method chaining
-
-        Example:
-            generator.add_relationship("User", "Post", RelationType.ONE_TO_MANY, back_populates="author")
+            GenerationReport with full metrics and status.
         """
-        # Find the source model
-        source = next((m for m in self.config.models if m.name == source_model), None)
-        if not source:
-            raise ValueError(f"Source model '{source_model}' not found. Add it first with add_model().")
+        report: GenerationReport = GenerationReport()
+        report.output_directory = str(output_dir.resolve())
 
-        # Create relationship name based on type
-        if relation_type == RelationType.ONE_TO_MANY:
-            rel_name = target_model.lower() + "s"  # posts
-        elif relation_type == RelationType.MANY_TO_ONE:
-            rel_name = target_model.lower()  # author
-        elif relation_type == RelationType.ONE_TO_ONE:
-            rel_name = target_model.lower()  # profile
-        else:  # MANY_TO_MANY
-            rel_name = target_model.lower() + "s"  # tags
-
-        relationship = Relationship(
-            name=rel_name,
-            target_model=target_model,
-            relation_type=relation_type,
-            back_populates=back_populates,
-            on_delete=on_delete
-        )
-
-        source.relationships.append(relationship)
-        print(f"  🔗 Relationship added: {source_model}.{rel_name} -> {target_model} ({relation_type.value})")
-        return self
-
-    def _auto_generate_endpoints(self, model: DatabaseModel):
-        """Automatically generate CRUD endpoints for a model"""
-        name_lower = model.name.lower()
-        name_plural = f"{name_lower}s"
-
-        # Build request body from user fields (using the enterprise model system)
-        request_fields = {}
-        for f in model.user_fields:
-            # Use the field_type value for display
-            request_fields[f.name] = f.field_type.value
-
-        crud_endpoints = [
-            APIEndpoint(
-                path=f"/{name_plural}",
-                method="GET",
-                name=f"list_{name_plural}",
-                description=f"Get all {name_plural} with pagination",
-                tags=[model.name]
-            ),
-            APIEndpoint(
-                path=f"/{name_plural}/{{id}}",
-                method="GET",
-                name=f"get_{name_lower}",
-                description=f"Get {name_lower} by ID",
-                tags=[model.name]
-            ),
-            APIEndpoint(
-                path=f"/{name_plural}",
-                method="POST",
-                name=f"create_{name_lower}",
-                description=f"Create new {name_lower}",
-                request_body=request_fields,
-                auth_required=True,
-                tags=[model.name]
-            ),
-            APIEndpoint(
-                path=f"/{name_plural}/{{id}}",
-                method="PUT",
-                name=f"update_{name_lower}",
-                description=f"Update {name_lower}",
-                request_body=request_fields,
-                auth_required=True,
-                tags=[model.name]
-            ),
-            APIEndpoint(
-                path=f"/{name_plural}/{{id}}",
-                method="DELETE",
-                name=f"delete_{name_lower}",
-                description=f"Delete {name_lower}",
-                auth_required=True,
-                tags=[model.name]
-            ),
-        ]
-
-        self.config.endpoints.extend(crud_endpoints)
-
-    def set_database(self, url: str) -> 'APIGenerator':
-        """Set database connection URL"""
-        self.config.database_url = url
-        print(f"  🗄️ Database: {url}")
-        return self
-
-    def enable_auth(self, enabled: bool = True) -> 'APIGenerator':
-        """Enable/disable authentication"""
-        self.config.auth_enabled = enabled
-        print(f"  🔐 Auth: {'enabled' if enabled else 'disabled'}")
-        return self
-
-    def enable_cors(self, enabled: bool = True) -> 'APIGenerator':
-        """Enable/disable CORS"""
-        self.config.cors_enabled = enabled
-        return self
-
-    def enable_docker(self, enabled: bool = True) -> 'APIGenerator':
-        """Enable/disable Docker support"""
-        self.config.docker_enabled = enabled
-        return self
-
-    def generate(self) -> Dict[str, Any]:
-        """
-        🚀 Generate the complete FastAPI project!
-
-        Returns:
-            Dict with generation results and statistics
-        """
-        print(f"\n{'='*60}")
-        print(f"🚀 GENERATING PROJECT: {self.config.name}")
-        print(f"{'='*60}\n")
-
-        # Create output directory
-        os.makedirs(self.output_dir, exist_ok=True)
-
-        # Generate all project files
-        steps = [
-            ("📁 Project structure", self._generate_structure),
-            ("🗄️ Database models", self._generate_models),
-            ("📋 Pydantic schemas", self._generate_schemas),
-            ("🔀 API routers", self._generate_routers),
-            ("🔐 Authentication", self._generate_auth),
-            ("⚙️ Configuration", self._generate_config),
-            ("💾 Database setup", self._generate_database),
-            ("🚀 Main application", self._generate_main),
-            ("📦 Requirements", self._generate_requirements),
-            ("🐳 Docker files", self._generate_docker),
-            ("📖 Documentation", self._generate_docs),
-        ]
-
-        results = {}
-        total_lines = 0
-
-        for step_name, step_func in steps:
+        # Step 1: Load file
+        with Timer("load_schema") as t_load:
             try:
-                lines = step_func()
-                total_lines += lines
-                results[step_name] = {"status": "✅", "lines": lines}
-                print(f"  {step_name}: ✅ ({lines} lines)")
-            except Exception as e:
-                results[step_name] = {"status": "❌", "error": str(e)}
-                print(f"  {step_name}: ❌ ({e})")
+                raw_data: Dict[str, Any] = load_schema_file(schema_path)
+                logger.info(
+                    "Loaded schema file: %s (%d top-level keys).",
+                    schema_path,
+                    len(raw_data),
+                )
+            except (FileNotFoundError, ValueError) as exc:
+                report.generation_errors.append(str(exc))
+                report.step_metrics.append(GenerationStepMetric(
+                    step_name="Load Schema File",
+                    success=False,
+                    elapsed_seconds=t_load.elapsed,
+                    detail=str(exc),
+                ))
+                return self._finalise_report(report, t_load.elapsed)
 
-        # Summary
-        summary = {
-            "project_name": self.config.name,
-            "total_files": len(self.generated_files),
-            "total_lines": total_lines,
-            "models": len(self.config.models),
-            "endpoints": len(self.config.endpoints),
-            "output_dir": self.output_dir,
-            "steps": results,
-        }
+        report.step_metrics.append(GenerationStepMetric(
+            step_name="Load Schema File",
+            success=True,
+            elapsed_seconds=t_load.elapsed,
+            detail=f"from {schema_path.name}",
+        ))
 
-        print(f"\n{'='*60}")
-        print(f"✅ GENERATION COMPLETE!")
-        print(f"   📁 Files: {summary['total_files']}")
-        print(f"   📝 Lines: {summary['total_lines']}")
-        print(f"   📦 Models: {summary['models']}")
-        print(f"   🔀 Endpoints: {summary['endpoints']}")
-        print(f"   📂 Output: {self.output_dir}")
-        print(f"{'='*60}\n")
+        # Step 2: Parse raw data
+        with Timer("parse_schema") as t_parse:
+            try:
+                # Apply config overrides
+                if config_overrides:
+                    config_key: Optional[str] = None
+                    for k in ("config", "generation_config", "generator_config"):
+                        if k in raw_data:
+                            config_key = k
+                            break
+                    if config_key is None:
+                        config_key = "config"
+                        raw_data[config_key] = {}
+                    raw_data[config_key].update(config_overrides)
 
-        # Save config
-        self._save_config(summary)
+                schema, config = parse_raw_schema(raw_data)
+                logger.info(
+                    "Parsed schema: %d tables, config: %s.",
+                    len(schema.tables),
+                    config.project_name,
+                )
+            except ValueError as exc:
+                report.generation_errors.append(str(exc))
+                report.step_metrics.append(GenerationStepMetric(
+                    step_name="Parse Schema",
+                    success=False,
+                    elapsed_seconds=t_parse.elapsed,
+                    detail=str(exc),
+                ))
+                return self._finalise_report(report, t_load.elapsed + t_parse.elapsed)
 
-        return summary
+        report.project_name = config.project_name
+        report.step_metrics.append(GenerationStepMetric(
+            step_name="Parse Schema",
+            success=True,
+            elapsed_seconds=t_parse.elapsed,
+            detail=f"{len(schema.tables)} tables parsed",
+        ))
 
-    def _generate_structure(self) -> int:
-        """Create project directory structure"""
-        dirs = [
-            "",
-            "app",
-            "app/api",
-            "app/api/v1",
-            "app/core",
-            "app/models",
-            "app/schemas",
-            "app/services",
-            "app/middleware",
-            "tests",
-            "tests/api",
-            "migrations",
-        ]
+        # Delegate to in-memory generate
+        return self._run_pipeline(schema, config, Path(output_dir), report)
 
-        for d in dirs:
-            path = os.path.join(self.output_dir, d)
-            os.makedirs(path, exist_ok=True)
+    # -----------------------------------------------------------------
+    # Public: generate from in-memory objects
+    # -----------------------------------------------------------------
 
-            # Create __init__.py for Python packages
-            if d.startswith("app") or d.startswith("tests"):
-                init_file = os.path.join(path, "__init__.py")
-                self._write_file(init_file, f'"""{d} package"""\n')
+    def generate(
+        self,
+        schema: SchemaDefinition,
+        config: GenerationConfig,
+        output_dir: Path,
+    ) -> GenerationReport:
+        """
+        Full pipeline from pre-parsed schema and config objects.
 
-        return len(dirs)
+        Args:
+            schema: Validated schema definition.
+            config: Validated generation configuration.
+            output_dir: Output directory.
 
-    def _generate_models(self) -> int:
-        """Generate SQLAlchemy database models"""
-        lines = 0
+        Returns:
+            GenerationReport.
+        """
+        report: GenerationReport = GenerationReport()
+        report.project_name = config.project_name
+        report.output_directory = str(output_dir.resolve())
 
-        for model in self.config.models:
-            code = self._template_engine.render_model(model)
-            filepath = os.path.join(
-                self.output_dir, "app", "models", f"{model.name.lower()}.py"
+        return self._run_pipeline(schema, config, output_dir, report)
+
+    # -----------------------------------------------------------------
+    # Internal: master pipeline
+    # -----------------------------------------------------------------
+
+    def _run_pipeline(
+        self,
+        schema: SchemaDefinition,
+        config: GenerationConfig,
+        output_dir: Path,
+        report: GenerationReport,
+    ) -> GenerationReport:
+        """Execute the core generation pipeline."""
+        pipeline_start: float = time.perf_counter()
+
+        # --- Step: Validation ---
+        validation_ok: bool = self._step_validate(
+            schema, config, report
+        )
+        if not validation_ok and self._strict_validation:
+            total_elapsed: float = time.perf_counter() - pipeline_start
+            return self._finalise_report(report, total_elapsed)
+
+        # --- Step: Topological sort ---
+        self._step_topological_sort(schema, report)
+
+        # --- Step: Code generation ---
+        generated_files: Dict[str, str] = self._step_generate(
+            schema, config, report
+        )
+
+        if not generated_files:
+            report.generation_errors.append(
+                "No files were generated — aborting export."
             )
-            self._write_file(filepath, code)
-            lines += code.count('\n')
+            total_elapsed = time.perf_counter() - pipeline_start
+            return self._finalise_report(report, total_elapsed)
 
-        # Generate base model
-        base_code = self._template_engine.render_base_model()
-        self._write_file(
-            os.path.join(self.output_dir, "app", "models", "base.py"),
-            base_code
-        )
-        lines += base_code.count('\n')
-
-        # Generate models __init__.py with all imports
-        init_code = self._template_engine.render_models_init(self.config.models)
-        self._write_file(
-            os.path.join(self.output_dir, "app", "models", "__init__.py"),
-            init_code
-        )
-        lines += init_code.count('\n')
-
-        return lines
-
-    def _generate_schemas(self) -> int:
-        """Generate Pydantic schemas"""
-        lines = 0
-
-        for model in self.config.models:
-            code = self._template_engine.render_schema(model)
-            filepath = os.path.join(
-                self.output_dir, "app", "schemas", f"{model.name.lower()}.py"
-            )
-            self._write_file(filepath, code)
-            lines += code.count('\n')
-
-        # Generate schemas __init__.py
-        init_code = self._template_engine.render_schemas_init(self.config.models)
-        self._write_file(
-            os.path.join(self.output_dir, "app", "schemas", "__init__.py"),
-            init_code
-        )
-        lines += init_code.count('\n')
-
-        return lines
-
-    def _generate_routers(self) -> int:
-        """Generate API route handlers"""
-        lines = 0
-
-        for model in self.config.models:
-            model_endpoints = [
-                ep for ep in self.config.endpoints
-                if model.name in ep.tags
-            ]
-            code = self._template_engine.render_router(model, model_endpoints)
-            filepath = os.path.join(
-                self.output_dir, "app", "api", "v1", f"{model.name.lower()}.py"
-            )
-            self._write_file(filepath, code)
-            lines += code.count('\n')
-
-        # Generate router __init__.py
-        init_code = self._template_engine.render_routers_init(self.config.models)
-        self._write_file(
-            os.path.join(self.output_dir, "app", "api", "v1", "__init__.py"),
-            init_code
-        )
-        lines += init_code.count('\n')
-
-        # Generate api __init__.py
-        api_init = '"""API package"""\n'
-        self._write_file(
-            os.path.join(self.output_dir, "app", "api", "__init__.py"),
-            api_init
-        )
-        lines += api_init.count('\n')
-
-        return lines
-
-    def _generate_auth(self) -> int:
-        """Generate authentication system"""
-        if not self.config.auth_enabled:
-            return 0
-
-        code = self._template_engine.render_auth()
-        filepath = os.path.join(self.output_dir, "app", "core", "auth.py")
-        self._write_file(filepath, code)
-        return code.count('\n')
-
-    def _generate_config(self) -> int:
-        """Generate configuration files"""
-        code = self._template_engine.render_config(self.config)
-        filepath = os.path.join(self.output_dir, "app", "core", "config.py")
-        self._write_file(filepath, code)
-
-        # Generate core __init__.py
-        core_init = '"""Core package - configuration, auth, database"""\n'
-        self._write_file(
-            os.path.join(self.output_dir, "app", "core", "__init__.py"),
-            core_init
+        # --- Step: Export ---
+        self._step_export(
+            generated_files, config, output_dir, schema, report
         )
 
-        return code.count('\n') + 1
+        total_elapsed = time.perf_counter() - pipeline_start
+        return self._finalise_report(report, total_elapsed)
 
-    def _generate_database(self) -> int:
-        """Generate database connection module"""
-        code = self._template_engine.render_database(self.config)
-        filepath = os.path.join(self.output_dir, "app", "core", "database.py")
-        self._write_file(filepath, code)
-        return code.count('\n')
+    # -----------------------------------------------------------------
+    # Pipeline step: Validation
+    # -----------------------------------------------------------------
 
-    def _generate_main(self) -> int:
-        """Generate main FastAPI application file"""
-        code = self._template_engine.render_main(self.config)
-        filepath = os.path.join(self.output_dir, "main.py")
-        self._write_file(filepath, code)
-        return code.count('\n')
-
-    def _generate_requirements(self) -> int:
-        """Generate requirements.txt"""
-        code = self._template_engine.render_requirements()
-        filepath = os.path.join(self.output_dir, "requirements.txt")
-        self._write_file(filepath, code)
-        return code.count('\n')
-
-    def _generate_docker(self) -> int:
-        """Generate Docker configuration"""
-        if not self.config.docker_enabled:
-            return 0
-
-        lines = 0
-
-        # Dockerfile
-        dockerfile = self._template_engine.render_dockerfile()
-        self._write_file(os.path.join(self.output_dir, "Dockerfile"), dockerfile)
-        lines += dockerfile.count('\n')
-
-        # docker-compose.yml
-        compose = self._template_engine.render_docker_compose(self.config)
-        self._write_file(os.path.join(self.output_dir, "docker-compose.yml"), compose)
-        lines += compose.count('\n')
-
-        # .env.example
-        env_example = self._template_engine.render_env_example(self.config)
-        self._write_file(os.path.join(self.output_dir, ".env.example"), env_example)
-        lines += env_example.count('\n')
-
-        # .gitignore
-        gitignore = self._template_engine.render_gitignore()
-        self._write_file(os.path.join(self.output_dir, ".gitignore"), gitignore)
-        lines += gitignore.count('\n')
-
-        return lines
-
-    def _generate_docs(self) -> int:
-        """Generate project documentation"""
-        code = self._template_engine.render_readme(self.config)
-        filepath = os.path.join(self.output_dir, "README.md")
-        self._write_file(filepath, code)
-        return code.count('\n')
-
-    def _write_file(self, filepath: str, content: str):
-        """Write content to file and track it"""
-        dir_path = os.path.dirname(filepath)
-        if dir_path:
-            os.makedirs(dir_path, exist_ok=True)
-        with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(content)
-        self.generated_files.append(filepath)
-
-    def _save_config(self, summary: Dict):
-        """Save generation config as JSON"""
-        config_path = os.path.join(self.output_dir, "apigen.json")
-        with open(config_path, 'w', encoding='utf-8') as f:
-            json.dump(summary, f, indent=2, default=str)
-        self.generated_files.append(config_path)
-
-
-class TemplateEngine:
-    """
-    🔧 Template Engine for generating code files
-    Renders Python code from templates and configurations.
-
-    PHASE 2 FIX: All methods are now properly indented inside this class.
-    Now fully integrated with the enterprise model system (ModelField, FieldType).
-    """
-
-    # ==========================================================================
-    # Type mappings for the enterprise ModelField system
-    # ==========================================================================
-    SQLALCHEMY_TYPE_MAP: Dict[FieldType, str] = {
-        FieldType.STRING: "String({max_length})",
-        FieldType.TEXT: "Text",
-        FieldType.INTEGER: "Integer",
-        FieldType.FLOAT: "Float",
-        FieldType.BOOLEAN: "Boolean",
-        FieldType.DATETIME: "DateTime(timezone=True)",
-        FieldType.DATE: "Date",
-        FieldType.EMAIL: "String(320)",
-        FieldType.URL: "String(2048)",
-        FieldType.UUID: "String(36)",
-        FieldType.JSON: "JSON",
-        FieldType.ENUM: "String(50)",
-        FieldType.FILE: "String(512)",
-        FieldType.IMAGE: "String(512)",
-        FieldType.PASSWORD: "String(128)",
-        FieldType.PHONE: "String(20)",
-        FieldType.SLUG: "String({max_length})",
-        FieldType.IP_ADDRESS: "String(45)",
-    }
-
-    PYDANTIC_TYPE_MAP: Dict[FieldType, str] = {
-        FieldType.STRING: "str",
-        FieldType.TEXT: "str",
-        FieldType.INTEGER: "int",
-        FieldType.FLOAT: "float",
-        FieldType.BOOLEAN: "bool",
-        FieldType.DATETIME: "datetime",
-        FieldType.DATE: "date",
-        FieldType.EMAIL: "EmailStr",
-        FieldType.URL: "HttpUrl",
-        FieldType.UUID: "str",
-        FieldType.JSON: "Dict[str, Any]",
-        FieldType.ENUM: "str",
-        FieldType.FILE: "str",
-        FieldType.IMAGE: "str",
-        FieldType.PASSWORD: "str",
-        FieldType.PHONE: "str",
-        FieldType.SLUG: "str",
-        FieldType.IP_ADDRESS: "str",
-    }
-
-    # ==========================================================================
-    # PHASE 2 FIX: These methods are now INSIDE the class (proper indentation)
-    # ==========================================================================
-    def _python_to_sqlalchemy(self, python_type: str) -> str:
+    def _step_validate(
+        self,
+        schema: SchemaDefinition,
+        config: GenerationConfig,
+        report: GenerationReport,
+    ) -> bool:
         """
-        Convert Python type string to SQLAlchemy column type.
-        LEGACY SUPPORT: For backward compatibility with simple string types.
+        Run the full validation pipeline.
+
+        Returns True if validation passed (or only warnings and not strict).
         """
-        type_map = {
-            "str": "String(255)",
-            "string": "String(255)",
-            "int": "Integer",
-            "integer": "Integer",
-            "float": "Float",
-            "bool": "Boolean",
-            "boolean": "Boolean",
-            "text": "Text",
-            "datetime": "DateTime(timezone=True)",
-            "date": "Date",
-            "email": "String(320)",
-            "url": "String(2048)",
-            "uuid": "String(36)",
-            "json": "JSON",
-            "password": "String(128)",
-            "phone": "String(20)",
-            "slug": "String(255)",
-            "ip_address": "String(45)",
-        }
-        return type_map.get(python_type.lower(), "String(255)")
+        with Timer("validation") as t:
+            result: ValidationResult = validate_full(schema, config)
 
-    def _normalize_type(self, field_type: str) -> str:
-        """
-        Normalize field type string to Python type annotation.
-        LEGACY SUPPORT: For backward compatibility with simple string types.
-        """
-        type_map = {
-            "str": "str",
-            "string": "str",
-            "int": "int",
-            "integer": "int",
-            "float": "float",
-            "bool": "bool",
-            "boolean": "bool",
-            "text": "str",
-            "datetime": "datetime",
-            "date": "date",
-            "email": "EmailStr",
-            "url": "HttpUrl",
-            "uuid": "str",
-            "json": "Dict[str, Any]",
-            "password": "str",
-            "phone": "str",
-            "slug": "str",
-            "ip_address": "str",
-        }
-        return type_map.get(field_type.lower(), "str")
+        report.validation_errors.extend(result.errors)
+        report.validation_warnings.extend(result.warnings)
 
-    # ==========================================================================
-    # New enterprise methods using ModelField
-    # ==========================================================================
-    def _get_sqlalchemy_type(self, field: ModelField) -> str:
-        """Get SQLAlchemy column type for a ModelField."""
-        type_template = self.SQLALCHEMY_TYPE_MAP.get(field.field_type, "String(255)")
-        max_length = field.max_length if field.max_length else 255
-        return type_template.format(max_length=max_length)
+        has_errors: bool = len(result.errors) > 0
+        has_warnings: bool = len(result.warnings) > 0
 
-    def _get_pydantic_type(self, field: ModelField) -> str:
-        """Get Pydantic type annotation for a ModelField."""
-        return self.PYDANTIC_TYPE_MAP.get(field.field_type, "str")
-
-    def _generate_column_definition(self, field: ModelField) -> str:
-        """Generate a complete SQLAlchemy Column definition for a ModelField."""
-        col_type = self._get_sqlalchemy_type(field)
-        parts = [col_type]
-
-        if field.primary_key:
-            parts.append("primary_key=True")
-        if field.unique:
-            parts.append("unique=True")
-        if field.indexed and not field.primary_key:
-            parts.append("index=True")
-        if field.nullable:
-            parts.append("nullable=True")
-        elif not field.primary_key:
-            parts.append("nullable=False")
-        if field.default is not None:
-            if isinstance(field.default, str):
-                parts.append(f'default="{field.default}"')
-            elif isinstance(field.default, bool):
-                parts.append(f"default={field.default}")
-            else:
-                parts.append(f"default={field.default}")
-
-        return f"Column({', '.join(parts)})"
-
-    # ==========================================================================
-    # Model rendering - now uses enterprise ModelField objects
-    # ==========================================================================
-    def render_model(self, model: DatabaseModel) -> str:
-        """Generate SQLAlchemy model code using ModelField objects."""
-        fields_code = []
-
-        # Get the table name using the property from DatabaseModel
-        table_name = model.get_table_name
-
-        # Process all fields (id, user fields, and timestamps are already in model.fields)
-        for field in model.fields:
-            # Skip id as we'll add it explicitly with autoincrement
-            if field.name == "id":
-                continue
-            # Skip timestamps as we'll add them with func.now()
-            if field.name in ("created_at", "updated_at"):
-                continue
-
-            column_def = self._generate_column_definition(field)
-            if field.description:
-                fields_code.append(f"    # {field.description}")
-            fields_code.append(f"    {field.name} = {column_def}")
-
-        fields_str = "\n".join(fields_code)
-
-        # Generate relationship code
-        relationships_code = []
-        for rel in model.relationships:
-            fk_code = rel.to_sqlalchemy_foreign_key()
-            if fk_code:
-                relationships_code.append(fk_code)
-            rel_code = rel.to_sqlalchemy_relationship()
-            if rel_code:
-                relationships_code.append(rel_code)
-
-        relationships_str = "\n".join(relationships_code) if relationships_code else ""
-
-        # Generate repr using first few user fields
-        repr_fields = model.user_fields[:3]
-        if repr_fields:
-            repr_parts = ", ".join(f'{f.name}={{self.{f.name}}}' for f in repr_fields)
-            repr_method = f'''
-    def __repr__(self):
-        return f"<{model.name}({repr_parts})>"'''
+        if has_errors:
+            detail: str = f"{len(result.errors)} error(s)"
+        elif has_warnings:
+            detail = f"{len(result.warnings)} warning(s)"
         else:
-            repr_method = f'''
-    def __repr__(self):
-        return f"<{model.name}(id={{self.id}})>"'''
+            detail = "all checks passed"
 
-        return f'''"""
-{model.name} Database Model
-Auto-generated by APIGen
-"""
+        report.step_metrics.append(GenerationStepMetric(
+            step_name="Validate Schema",
+            success=result.is_valid,
+            elapsed_seconds=t.elapsed,
+            detail=detail,
+        ))
 
-from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, Date, Text, JSON, ForeignKey, Table
-from sqlalchemy.orm import relationship
-from sqlalchemy.sql import func
-from datetime import datetime
-from app.models.base import Base
-
-
-class {model.name}(Base):
-    """{model.description if model.description else f'SQLAlchemy model for {model.name}'}"""
-
-    __tablename__ = "{table_name}"
-
-    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-{fields_str}
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-{relationships_str}
-{repr_method}
-
-    def to_dict(self):
-        """Convert model to dictionary"""
-        return {{
-            col.name: getattr(self, col.name)
-            for col in self.__table__.columns
-        }}
-'''
-
-    def render_base_model(self) -> str:
-        """Generate base SQLAlchemy model."""
-        return '''"""
-Base Database Model
-Auto-generated by APIGen
-"""
-
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-
-Base = declarative_base()
-
-
-def get_engine(database_url: str):
-    """Create database engine"""
-    connect_args = {}
-    if database_url.startswith("sqlite"):
-        connect_args["check_same_thread"] = False
-    return create_engine(database_url, echo=False, connect_args=connect_args)
-
-
-def get_session_factory(engine):
-    """Create session factory"""
-    return sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-
-def init_db(engine):
-    """Initialize database tables"""
-    Base.metadata.create_all(bind=engine)
-'''
-
-    def render_models_init(self, models: List[DatabaseModel]) -> str:
-        """Generate models package __init__.py."""
-        imports = ["from app.models.base import Base, get_engine, get_session_factory, init_db"]
-        for model in models:
-            imports.append(f"from app.models.{model.name.lower()} import {model.name}")
-
-        all_exports = ["Base", "get_engine", "get_session_factory", "init_db"]
-        all_exports.extend([m.name for m in models])
-
-        return f'''"""
-Database Models Package
-Auto-generated by APIGen
-"""
-
-{chr(10).join(imports)}
-
-__all__ = {all_exports}
-'''
-
-    # ==========================================================================
-    # Schema rendering - now uses enterprise ModelField objects
-    # ==========================================================================
-    def render_schema(self, model: DatabaseModel) -> str:
-        """Generate Pydantic schema code using ModelField objects."""
-        # Get user-defined fields (exclude auto fields like id, timestamps)
-        user_fields = model.user_fields
-
-        # Base schema fields (required)
-        base_fields_code = []
-        for field in user_fields:
-            py_type = self._get_pydantic_type(field)
-            if not field.required or field.nullable:
-                base_fields_code.append(f"    {field.name}: Optional[{py_type}] = None")
-            elif field.default is not None:
-                if isinstance(field.default, str):
-                    base_fields_code.append(f'    {field.name}: {py_type} = "{field.default}"')
-                else:
-                    base_fields_code.append(f"    {field.name}: {py_type} = {field.default}")
-            else:
-                base_fields_code.append(f"    {field.name}: {py_type}")
-
-        base_fields_str = "\n".join(base_fields_code) if base_fields_code else "    pass"
-
-        # Update schema fields (all optional for partial updates)
-        update_fields_code = []
-        for field in user_fields:
-            py_type = self._get_pydantic_type(field)
-            update_fields_code.append(f"    {field.name}: Optional[{py_type}] = None")
-
-        update_fields_str = "\n".join(update_fields_code) if update_fields_code else "    pass"
-
-        # Determine required imports based on field types
-        needs_email = any(f.field_type == FieldType.EMAIL for f in user_fields)
-        needs_url = any(f.field_type == FieldType.URL for f in user_fields)
-
-        pydantic_imports = "from pydantic import BaseModel, Field"
-        if needs_email:
-            pydantic_imports += ", EmailStr"
-        if needs_url:
-            pydantic_imports += ", HttpUrl"
-
-        return f'''"""
-{model.name} Pydantic Schemas
-Auto-generated by APIGen
-"""
-
-{pydantic_imports}
-from typing import Optional, List, Dict, Any
-from datetime import datetime, date
-
-
-class {model.name}Base(BaseModel):
-    """{model.name} base schema with common fields"""
-{base_fields_str}
-
-
-class {model.name}Create({model.name}Base):
-    """Schema for creating {model.name}"""
-    pass
-
-
-class {model.name}Update(BaseModel):
-    """Schema for updating {model.name} (all fields optional)"""
-{update_fields_str}
-
-
-class {model.name}Response({model.name}Base):
-    """Schema for {model.name} API response"""
-    id: int
-    created_at: Optional[datetime] = None
-    updated_at: Optional[datetime] = None
-
-    class Config:
-        from_attributes = True
-
-
-class {model.name}ListResponse(BaseModel):
-    """Schema for paginated list of {model.name}"""
-    items: List[{model.name}Response]
-    total: int
-    page: int = 1
-    per_page: int = 10
-
-    class Config:
-        from_attributes = True
-'''
-
-    def render_schemas_init(self, models: List[DatabaseModel]) -> str:
-        """Generate schemas package __init__.py."""
-        imports = []
-        exports = []
-
-        for model in models:
-            name_lower = model.name.lower()
-            imports.append(
-                f"from app.schemas.{name_lower} import ("
-                f"{model.name}Base, {model.name}Create, {model.name}Update, "
-                f"{model.name}Response, {model.name}ListResponse)"
+        if has_errors:
+            logger.error(
+                "Validation failed with %d error(s) in %.3fs.",
+                len(result.errors),
+                t.elapsed,
             )
-            exports.extend([
-                f"{model.name}Base",
-                f"{model.name}Create",
-                f"{model.name}Update",
-                f"{model.name}Response",
-                f"{model.name}ListResponse",
-            ])
+            for err in result.errors:
+                logger.error("  ✗ %s", err)
+            return False
 
-        return f'''"""
-Pydantic Schemas Package
-Auto-generated by APIGen
-"""
+        if has_warnings:
+            logger.warning(
+                "Validation passed with %d warning(s) in %.3fs.",
+                len(result.warnings),
+                t.elapsed,
+            )
+            for warn in result.warnings:
+                logger.warning("  ⚠ %s", warn)
 
-{chr(10).join(imports)}
+            if self._fail_on_warnings:
+                return False
 
-__all__ = {exports}
-'''
+        else:
+            logger.info(
+                "Validation passed: %d tables validated in %.3fs.",
+                len(schema.tables),
+                t.elapsed,
+            )
 
-    # ==========================================================================
-    # Router rendering - COMPLETE with full CRUD implementation
-    # ==========================================================================
-    def render_router(self, model: DatabaseModel, endpoints: List[APIEndpoint]) -> str:
-        """Generate FastAPI router code - COMPLETE VERSION with all CRUD operations."""
-        name_lower = model.name.lower()
-        name_plural = f"{name_lower}s"
+        return True
 
-        return f'''"""
-{model.name} API Router
-Auto-generated by APIGen
-"""
+    # -----------------------------------------------------------------
+    # Pipeline step: Topological sort
+    # -----------------------------------------------------------------
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy.orm import Session
-from typing import List, Optional
-from app.schemas.{name_lower} import (
-    {model.name}Create,
-    {model.name}Update,
-    {model.name}Response,
-    {model.name}ListResponse
-)
-from app.models.{name_lower} import {model.name}
-from app.core.database import get_db
+    def _step_topological_sort(
+        self,
+        schema: SchemaDefinition,
+        report: GenerationReport,
+    ) -> None:
+        """Compute topological order of tables for generation."""
+        with Timer("topological_sort") as t:
+            try:
+                ordered_names: List[str] = schema.topological_order()
+                logger.info(
+                    "Topological order computed: %s in %.3fs.",
+                    " → ".join(ordered_names),
+                    t.elapsed,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Topological sort failed (will use declaration order): %s",
+                    exc,
+                )
+                ordered_names = [tbl.name for tbl in schema.tables]
 
-router = APIRouter(prefix="/{name_plural}", tags=["{model.name}"])
+        report.step_metrics.append(GenerationStepMetric(
+            step_name="Topological Sort",
+            success=True,
+            elapsed_seconds=t.elapsed,
+            detail=f"{len(ordered_names)} tables ordered",
+        ))
 
+    # -----------------------------------------------------------------
+    # Pipeline step: Code generation
+    # -----------------------------------------------------------------
 
-@router.get("/", response_model={model.name}ListResponse)
-async def list_{name_plural}(
-    page: int = Query(1, ge=1, description="Page number"),
-    per_page: int = Query(10, ge=1, le=100, description="Items per page"),
-    db: Session = Depends(get_db)
-):
-    """
-    Get all {name_plural} with pagination.
+    def _step_generate(
+        self,
+        schema: SchemaDefinition,
+        config: GenerationConfig,
+        report: GenerationReport,
+    ) -> Dict[str, str]:
+        """
+        Run the template engine to generate all code files.
 
-    - **page**: Page number (starting from 1)
-    - **per_page**: Number of items per page (max 100)
-    """
-    offset = (page - 1) * per_page
-    total = db.query({model.name}).count()
-    items = db.query({model.name}).offset(offset).limit(per_page).all()
+        If ``skip_invalid_tables`` is True, tables that cause generation
+        errors are skipped and the rest are still generated.
+        """
+        generated_files: Dict[str, str] = {}
 
-    return {{
-        "items": items,
-        "total": total,
-        "page": page,
-        "per_page": per_page
-    }}
+        with Timer("code_generation") as t:
+            try:
+                template_gen: TemplateGenerator = TemplateGenerator(config)
 
+                # Use the aggregate method for clean code
+                all_files: Dict[str, str] = template_gen.generate_all(schema)
+                generated_files.update(all_files)
 
-@router.get("/{{item_id}}", response_model={model.name}Response)
-async def get_{name_lower}(
-    item_id: int,
-    db: Session = Depends(get_db)
-):
-    """
-    Get a single {name_lower} by ID.
+            except Exception as exc:
+                error_msg: str = (
+                    f"Fatal generation error: {type(exc).__name__}: {exc}"
+                )
+                report.generation_errors.append(error_msg)
+                logger.error(error_msg, exc_info=True)
 
-    - **item_id**: The unique identifier of the {name_lower}
-    """
-    item = db.query({model.name}).filter({model.name}.id == item_id).first()
-    if not item:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="{model.name} not found"
+        # Compute metrics
+        total_lines: int = sum(
+            count_lines(content) for content in generated_files.values()
         )
-    return item
+        total_bytes: int = sum(
+            len(content.encode("utf-8")) for content in generated_files.values()
+        )
+        tables_processed: int = len(schema.tables)
 
+        report.total_tables_processed = tables_processed
 
-@router.post("/", response_model={model.name}Response, status_code=status.HTTP_201_CREATED)
-async def create_{name_lower}(
-    data: {model.name}Create,
-    db: Session = Depends(get_db)
-):
-    """
-    Create a new {name_lower}.
-
-    Pass the required fields in the request body.
-    """
-    item = {model.name}(**data.model_dump())
-    db.add(item)
-    db.commit()
-    db.refresh(item)
-    return item
-
-
-@router.put("/{{item_id}}", response_model={model.name}Response)
-async def update_{name_lower}(
-    item_id: int,
-    data: {model.name}Update,
-    db: Session = Depends(get_db)
-):
-    """
-    Update an existing {name_lower}.
-
-    - **item_id**: The unique identifier of the {name_lower}
-    - Only provided fields will be updated
-    """
-    item = db.query({model.name}).filter({model.name}.id == item_id).first()
-    if not item:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="{model.name} not found"
+        detail_str: str = (
+            f"{len(generated_files)} files, "
+            f"~{total_lines:,} lines, "
+            f"{tables_processed} tables"
         )
 
-    # Update only provided fields (exclude unset)
-    update_data = data.model_dump(exclude_unset=True)
-    for key, value in update_data.items():
-        setattr(item, key, value)
+        report.step_metrics.append(GenerationStepMetric(
+            step_name="Code Generation",
+            success=len(report.generation_errors) == 0,
+            elapsed_seconds=t.elapsed,
+            detail=detail_str,
+        ))
 
-    db.commit()
-    db.refresh(item)
-    return item
-
-
-@router.delete("/{{item_id}}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_{name_lower}(
-    item_id: int,
-    db: Session = Depends(get_db)
-):
-    """
-    Delete a {name_lower} by ID.
-
-    - **item_id**: The unique identifier of the {name_lower}
-    """
-    item = db.query({model.name}).filter({model.name}.id == item_id).first()
-    if not item:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="{model.name} not found"
+        logger.info(
+            "Code generation complete: %s in %.3fs.",
+            detail_str,
+            t.elapsed,
         )
 
-    db.delete(item)
-    db.commit()
-    return None
-'''
+        return generated_files
 
-    def render_routers_init(self, models: List[DatabaseModel]) -> str:
-        """Generate routers package __init__.py."""
-        imports = []
-        router_includes = []
+    # -----------------------------------------------------------------
+    # Pipeline step: Export
+    # -----------------------------------------------------------------
 
-        for model in models:
-            name_lower = model.name.lower()
-            imports.append(f"from app.api.v1.{name_lower} import router as {name_lower}_router")
-            router_includes.append(f"api_router.include_router({name_lower}_router)")
+    def _step_export(
+        self,
+        generated_files: Dict[str, str],
+        config: GenerationConfig,
+        output_dir: Path,
+        schema: SchemaDefinition,
+        report: GenerationReport,
+    ) -> None:
+        """Write all generated files to the filesystem."""
+        with Timer("export") as t:
+            exporter: ProjectExporter = ProjectExporter(
+                config=config,
+                output_dir=output_dir,
+                clean_before_export=self._clean_output,
+                atomic_writes=True,
+                generate_manifest=True,
+                generate_project_files=True,
+            )
 
-        return f'''"""
-API V1 Routers
-Auto-generated by APIGen
-"""
+            export_result: ExportResult = exporter.export(
+                generated_files, schema
+            )
 
-from fastapi import APIRouter
+        report.total_files = export_result.manifest.total_files
+        report.total_bytes = export_result.manifest.total_bytes
+        report.total_lines = export_result.manifest.total_lines
+        report.export_errors.extend(export_result.errors)
+        report.manifest = export_result.manifest
 
-{chr(10).join(imports)}
+        report.step_metrics.append(GenerationStepMetric(
+            step_name="Export to Filesystem",
+            success=export_result.success,
+            elapsed_seconds=t.elapsed,
+            detail=(
+                f"{export_result.manifest.total_files} files, "
+                f"{export_result.manifest.total_bytes:,} bytes"
+            ),
+        ))
 
-api_router = APIRouter()
+        if export_result.success:
+            logger.info(
+                "Export complete: %d files to %s in %.3fs.",
+                export_result.manifest.total_files,
+                output_dir,
+                t.elapsed,
+            )
+        else:
+            logger.error(
+                "Export finished with %d error(s) in %.3fs.",
+                len(export_result.errors),
+                t.elapsed,
+            )
 
-{chr(10).join(router_includes)}
-'''
+    # -----------------------------------------------------------------
+    # Internal: finalise report
+    # -----------------------------------------------------------------
 
-    # ==========================================================================
-    # Authentication system
-    # ==========================================================================
-    def render_auth(self) -> str:
-        """Generate authentication system."""
-        return '''"""
-Authentication System
-Auto-generated by APIGen
-"""
+    def _finalise_report(
+        self,
+        report: GenerationReport,
+        total_elapsed: float,
+    ) -> GenerationReport:
+        """Set final status and timing on the report."""
+        report.total_elapsed_seconds = total_elapsed
 
-from datetime import datetime, timedelta
-from typing import Optional
-from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from jose import JWTError, jwt
-from passlib.context import CryptContext
-from pydantic import BaseModel
-from app.core.config import settings
-
-# Password hashing
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-# JWT Bearer
-security = HTTPBearer()
-
-
-class TokenData(BaseModel):
-    """Token payload data"""
-    sub: Optional[str] = None
-    exp: Optional[datetime] = None
-
-
-class Token(BaseModel):
-    """Token response"""
-    access_token: str
-    token_type: str = "bearer"
-
-
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify a password against its hash"""
-    return pwd_context.verify(plain_password, hashed_password)
-
-
-def get_password_hash(password: str) -> str:
-    """Generate password hash"""
-    return pwd_context.hash(password)
-
-
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
-    """Create JWT access token"""
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
-    return encoded_jwt
-
-
-def decode_token(token: str) -> TokenData:
-    """Decode and validate JWT token"""
-    try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        return TokenData(**payload)
-    except JWTError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not validate credentials",
-            headers={"WWW-Authenticate": "Bearer"},
+        has_errors: bool = (
+            len(report.validation_errors) > 0
+            or len(report.generation_errors) > 0
+            or len(report.export_errors) > 0
         )
 
+        report.success = not has_errors
 
-async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security)
-) -> TokenData:
-    """Get current user from JWT token"""
-    token = credentials.credentials
-    return decode_token(token)
-'''
+        return report
 
-    # ==========================================================================
-    # Configuration files
-    # ==========================================================================
-    def render_config(self, config: ProjectConfig) -> str:
-        """Generate configuration file."""
-        return f'''"""
-Application Configuration
-Auto-generated by APIGen
-"""
 
-import os
-from typing import List
-from pydantic_settings import BaseSettings
+# ---------------------------------------------------------------------------
+# Module-level exports
+# ---------------------------------------------------------------------------
 
+__all__: List[str] = [
+    "APIGenerator",
+    "GenerationReport",
+    "GenerationStepMetric",
+    "load_schema_file",
+    "parse_raw_schema",
+]
 
-class Settings(BaseSettings):
-    """Application settings loaded from environment variables"""
-
-    # Application
-    APP_NAME: str = "{config.name}"
-    APP_VERSION: str = "{config.version}"
-    DEBUG: bool = False
-
-    # Database
-    DATABASE_URL: str = "{config.database_url}"
-
-    # Security
-    SECRET_KEY: str = "your-super-secret-key-change-in-production"
-    ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
-
-    # CORS
-    CORS_ORIGINS: List[str] = ["*"]
-    CORS_ALLOW_CREDENTIALS: bool = True
-    CORS_ALLOW_METHODS: List[str] = ["*"]
-    CORS_ALLOW_HEADERS: List[str] = ["*"]
-
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
-
-
-settings = Settings()
-'''
-
-    def render_database(self, config: ProjectConfig) -> str:
-        """Generate database connection module."""
-        return f'''"""
-Database Connection
-Auto-generated by APIGen
-"""
-
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, Session
-from typing import Generator
-from app.core.config import settings
-
-# Create engine with appropriate settings
-connect_args = {{}}
-if settings.DATABASE_URL.startswith("sqlite"):
-    connect_args["check_same_thread"] = False
-
-engine = create_engine(
-    settings.DATABASE_URL,
-    echo=settings.DEBUG,
-    connect_args=connect_args
-)
-
-# Session factory
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-
-def get_db() -> Generator[Session, None, None]:
-    """
-    Database session dependency.
-
-    Yields a database session and ensures it's closed after use.
-    """
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
-def init_database():
-    """Initialize database tables"""
-    from app.models.base import Base
-    Base.metadata.create_all(bind=engine)
-'''
-
-    # ==========================================================================
-    # Main application file
-    # ==========================================================================
-    def render_main(self, config: ProjectConfig) -> str:
-        """Generate main FastAPI application file."""
-        cors_setup = ""
-        if config.cors_enabled:
-            cors_setup = '''
-from fastapi.middleware.cors import CORSMiddleware
-
-# CORS configuration
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
-    allow_credentials=settings.CORS_ALLOW_CREDENTIALS,
-    allow_methods=settings.CORS_ALLOW_METHODS,
-    allow_headers=settings.CORS_ALLOW_HEADERS,
-)
-'''
-
-        router_imports = []
-        router_includes = []
-        for model in config.models:
-            name_lower = model.name.lower()
-            router_imports.append(f"from app.api.v1.{name_lower} import router as {name_lower}_router")
-            router_includes.append(f"app.include_router({name_lower}_router, prefix=\"/api/v1\")")
-
-        return f'''"""
-{config.name} - Main Application
-Auto-generated by APIGen
-"""
-
-from fastapi import FastAPI
-from contextlib import asynccontextmanager
-from app.core.config import settings
-from app.core.database import init_database
-{chr(10).join(router_imports)}
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Application lifespan handler"""
-    # Startup
-    print("🚀 Starting {config.name}...")
-    init_database()
-    print("✅ Database initialized")
-    yield
-    # Shutdown
-    print("👋 Shutting down {config.name}...")
-
-
-app = FastAPI(
-    title="{config.name}",
-    description="{config.description}",
-    version="{config.version}",
-    lifespan=lifespan,
-    docs_url="/docs",
-    redoc_url="/redoc",
-)
-{cors_setup}
-
-# Include routers
-{chr(10).join(router_includes)}
-
-
-@app.get("/", tags=["Health"])
-async def root():
-    """Root endpoint - API health check"""
-    return {{
-        "name": settings.APP_NAME,
-        "version": settings.APP_VERSION,
-        "status": "healthy",
-        "docs": "/docs"
-    }}
-
-
-@app.get("/health", tags=["Health"])
-async def health_check():
-    """Detailed health check endpoint"""
-    return {{
-        "status": "healthy",
-        "database": "connected",
-        "version": settings.APP_VERSION
-    }}
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
-'''
-
-    # ==========================================================================
-    # Requirements and Docker
-    # ==========================================================================
-    def render_requirements(self) -> str:
-        """Generate requirements.txt."""
-        return '''# Auto-generated by APIGen
-# Core
-fastapi>=0.109.0
-uvicorn[standard]>=0.27.0
-pydantic>=2.5.0
-pydantic-settings>=2.1.0
-
-# Database
-sqlalchemy>=2.0.0
-alembic>=1.13.0
-
-# Authentication
-python-jose[cryptography]>=3.3.0
-passlib[bcrypt]>=1.7.4
-
-# Validation
-email-validator>=2.1.0
-
-# HTTP
-httpx>=0.26.0
-
-# Development
-python-dotenv>=1.0.0
-'''
-
-    def render_dockerfile(self) -> str:
-        """Generate Dockerfile."""
-        return '''# Auto-generated by APIGen
-FROM python:3.11-slim
-
-# Set environment variables
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-
-# Set work directory
-WORKDIR /app
-
-# Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \\
-    gcc \\
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip && \\
-    pip install --no-cache-dir -r requirements.txt
-
-# Copy project
-COPY . .
-
-# Expose port
-EXPOSE 8000
-
-# Run application
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
-'''
-
-    def render_docker_compose(self, config: ProjectConfig) -> str:
-        """Generate docker-compose.yml."""
-        service_name = config.name.lower().replace(" ", "_").replace("-", "_")
-        return f'''# Auto-generated by APIGen
-version: '3.8'
-
-services:
-  api:
-    build: .
-    container_name: {service_name}_api
-    ports:
-      - "8000:8000"
-    environment:
-      - DATABASE_URL=${{DATABASE_URL:-{config.database_url}}}
-      - SECRET_KEY=${{SECRET_KEY:-your-secret-key}}
-      - DEBUG=${{DEBUG:-false}}
-    volumes:
-      - .:/app
-    depends_on:
-      - db
-    restart: unless-stopped
-    networks:
-      - {service_name}_network
-
-  db:
-    image: postgres:15-alpine
-    container_name: {service_name}_db
-    environment:
-      - POSTGRES_DB={service_name}
-      - POSTGRES_USER=admin
-      - POSTGRES_PASSWORD=secret
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    restart: unless-stopped
-    networks:
-      - {service_name}_network
-
-volumes:
-  pgdata:
-
-networks:
-  {service_name}_network:
-    driver: bridge
-'''
-
-    def render_env_example(self, config: ProjectConfig) -> str:
-        """Generate .env.example file."""
-        return f'''# Environment Configuration
-# Copy this file to .env and update values
-
-# Application
-APP_NAME={config.name}
-DEBUG=false
-
-# Database
-DATABASE_URL={config.database_url}
-
-# Security
-SECRET_KEY=your-super-secret-key-change-this-in-production
-ACCESS_TOKEN_EXPIRE_MINUTES=30
-
-# CORS (comma-separated origins)
-CORS_ORIGINS=http://localhost:3000,http://localhost:8080
-'''
-
-    def render_gitignore(self) -> str:
-        """Generate .gitignore file."""
-        return '''# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
-
-# C extensions
-*.so
-
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# PyInstaller
-*.manifest
-*.spec
-
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
-.pytest_cache/
-
-# Translations
-*.mo
-*.pot
-
-# Environments
-.env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-
-# Database
-*.db
-*.sqlite3
-
-# Logs
-*.log
-logs/
-
-# OS
-.DS_Store
-Thumbs.db
-'''
-
-    # ==========================================================================
-    # README - FIXED markdown fence issue
-    # ==========================================================================
-    def render_readme(self, config: ProjectConfig) -> str:
-        """Generate project README - FIXED VERSION with proper markdown."""
-        models_doc = ""
-        for model in config.models:
-            user_fields = model.user_fields
-            fields_list = []
-            for f in user_fields[:5]:
-                field_type = f.field_type.value if hasattr(f.field_type, 'value') else str(f.field_type)
-                fields_list.append(f"`{f.name}`: {field_type}")
-            fields = ", ".join(fields_list)
-            if len(user_fields) > 5:
-                fields += f", ... (+{len(user_fields) - 5} more)"
-            models_doc += f"- **{model.name}**: {fields}\n"
-
-        endpoints_doc = ""
-        for model in config.models:
-            name_lower = model.name.lower()
-            endpoints_doc += f"""
-### {model.name}
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/v1/{name_lower}s` | List all with pagination |
-| GET | `/api/v1/{name_lower}s/{{id}}` | Get by ID |
-| POST | `/api/v1/{name_lower}s` | Create new |
-| PUT | `/api/v1/{name_lower}s/{{id}}` | Update existing |
-| DELETE | `/api/v1/{name_lower}s/{{id}}` | Delete |
-"""
-
-        return f'''# {config.name}
-
-> 🚀 Auto-generated by [APIGen](https://github.com/nexaflow/apigen) - The AI-Powered API Generator
-
-## 📋 Overview
-
-- **Version:** {config.version}
-- **Models:** {len(config.models)}
-- **Endpoints:** {len(config.endpoints)}
-- **Authentication:** {'Enabled (JWT)' if config.auth_enabled else 'Disabled'}
-- **Docker:** {'Enabled' if config.docker_enabled else 'Disabled'}
-
-## 🚀 Quick Start
-
-### Local Development
-```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Run the server
-uvicorn main:app --reload
-
-### Docker
-
-bash
-# Build and run with Docker Compose
-docker-compose up -d
-
-# View logs
-docker-compose logs -f api
-
-## 📖 API Documentation
-
-Once running, visit:
-- **Swagger UI:** http://localhost:8000/docs
-- **ReDoc:** http://localhost:8000/redoc
-
-## 📦 Models
-
-{models_doc}
-
-## 🔀 Endpoints
-{endpoints_doc}
-
-## ⚙️ Configuration
-
-Copy `.env.example` to `.env` and update the values:
-
-bash
-cp .env.
+logger.debug("apigen.generator loaded.")
