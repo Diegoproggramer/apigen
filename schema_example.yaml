@@ -1,0 +1,382 @@
+# schema_example.yaml
+# سیستم فروشگاه آنلاین - Online Shop System
+# شامل جداول: User, Category, Product, Order, OrderItem, Review
+
+project:
+  name: "online_shop"
+  version: "1.0.0"
+  description: "A complete online shop API with users, products, orders and reviews"
+  database_url: "postgresql+asyncpg://shop_user:shop_pass@localhost:5432/online_shop_db"
+
+config:
+  api_prefix: "/api/v1"
+  enable_soft_delete: true
+  enable_timestamps: true
+  enable_pagination: true
+  default_page_size: 20
+  max_page_size: 100
+  auth_enabled: true
+
+tables:
+  - name: "User"
+    description: "Registered users of the online shop"
+    columns:
+      - name: "id"
+        type: "integer"
+        primary_key: true
+        autoincrement: true
+        description: "Unique user identifier"
+      - name: "username"
+        type: "string"
+        max_length: 80
+        unique: true
+        nullable: false
+        index: true
+        description: "Unique username for login"
+      - name: "email"
+        type: "string"
+        max_length: 255
+        unique: true
+        nullable: false
+        index: true
+        description: "User email address"
+      - name: "hashed_password"
+        type: "string"
+        max_length: 512
+        nullable: false
+        description: "Bcrypt hashed password"
+      - name: "full_name"
+        type: "string"
+        max_length: 150
+        nullable: true
+        description: "Full display name"
+      - name: "phone"
+        type: "string"
+        max_length: 20
+        nullable: true
+        description: "Contact phone number"
+      - name: "is_active"
+        type: "boolean"
+        default: true
+        nullable: false
+        description: "Whether the account is active"
+      - name: "is_admin"
+        type: "boolean"
+        default: false
+        nullable: false
+        description: "Whether user has admin privileges"
+      - name: "created_at"
+        type: "datetime"
+        nullable: false
+        server_default: "now()"
+        description: "Account creation timestamp"
+      - name: "updated_at"
+        type: "datetime"
+        nullable: true
+        onupdate: "now()"
+        description: "Last profile update timestamp"
+    relationships:
+      - name: "orders"
+        target: "Order"
+        type: "one-to-many"
+        back_populates: "user"
+        cascade: "all, delete-orphan"
+      - name: "reviews"
+        target: "Review"
+        type: "one-to-many"
+        back_populates: "user"
+        cascade: "all, delete-orphan"
+
+  - name: "Category"
+    description: "Product categories for organizing the catalog"
+    columns:
+      - name: "id"
+        type: "integer"
+        primary_key: true
+        autoincrement: true
+      - name: "name"
+        type: "string"
+        max_length: 100
+        unique: true
+        nullable: false
+        index: true
+        description: "Category display name"
+      - name: "slug"
+        type: "string"
+        max_length: 120
+        unique: true
+        nullable: false
+        index: true
+        description: "URL-friendly slug"
+      - name: "description"
+        type: "text"
+        nullable: true
+        description: "Category description"
+      - name: "is_active"
+        type: "boolean"
+        default: true
+        nullable: false
+      - name: "parent_id"
+        type: "integer"
+        nullable: true
+        foreign_key: "Category.id"
+        description: "Self-referencing parent category for hierarchy"
+      - name: "created_at"
+        type: "datetime"
+        nullable: false
+        server_default: "now()"
+    relationships:
+      - name: "products"
+        target: "Product"
+        type: "one-to-many"
+        back_populates: "category"
+      - name: "children"
+        target: "Category"
+        type: "one-to-many"
+        back_populates: "parent"
+      - name: "parent"
+        target: "Category"
+        type: "many-to-one"
+        back_populates: "children"
+
+  - name: "Product"
+    description: "Products available in the shop"
+    columns:
+      - name: "id"
+        type: "integer"
+        primary_key: true
+        autoincrement: true
+      - name: "name"
+        type: "string"
+        max_length: 200
+        nullable: false
+        index: true
+        description: "Product name"
+      - name: "slug"
+        type: "string"
+        max_length: 220
+        unique: true
+        nullable: false
+        index: true
+        description: "URL-friendly product slug"
+      - name: "description"
+        type: "text"
+        nullable: true
+        description: "Detailed product description"
+      - name: "price"
+        type: "float"
+        nullable: false
+        description: "Current selling price"
+      - name: "discount_percent"
+        type: "float"
+        default: 0.0
+        nullable: false
+        description: "Discount percentage (0-100)"
+      - name: "stock_quantity"
+        type: "integer"
+        default: 0
+        nullable: false
+        description: "Available stock count"
+      - name: "sku"
+        type: "string"
+        max_length: 50
+        unique: true
+        nullable: false
+        description: "Stock Keeping Unit code"
+      - name: "image_url"
+        type: "string"
+        max_length: 500
+        nullable: true
+        description: "Main product image URL"
+      - name: "is_active"
+        type: "boolean"
+        default: true
+        nullable: false
+      - name: "category_id"
+        type: "integer"
+        nullable: false
+        foreign_key: "Category.id"
+        index: true
+        description: "Foreign key to Category"
+      - name: "created_at"
+        type: "datetime"
+        nullable: false
+        server_default: "now()"
+      - name: "updated_at"
+        type: "datetime"
+        nullable: true
+        onupdate: "now()"
+    relationships:
+      - name: "category"
+        target: "Category"
+        type: "many-to-one"
+        back_populates: "products"
+      - name: "order_items"
+        target: "OrderItem"
+        type: "one-to-many"
+        back_populates: "product"
+      - name: "reviews"
+        target: "Review"
+        type: "one-to-many"
+        back_populates: "product"
+        cascade: "all, delete-orphan"
+
+  - name: "Order"
+    description: "Customer orders"
+    columns:
+      - name: "id"
+        type: "integer"
+        primary_key: true
+        autoincrement: true
+      - name: "order_number"
+        type: "string"
+        max_length: 30
+        unique: true
+        nullable: false
+        index: true
+        description: "Human-readable order number"
+      - name: "status"
+        type: "string"
+        max_length: 20
+        default: "pending"
+        nullable: false
+        index: true
+        description: "Order status: pending, confirmed, shipped, delivered, cancelled"
+      - name: "total_amount"
+        type: "float"
+        nullable: false
+        default: 0.0
+        description: "Total order amount"
+      - name: "shipping_address"
+        type: "text"
+        nullable: false
+        description: "Full shipping address"
+      - name: "notes"
+        type: "text"
+        nullable: true
+        description: "Customer notes for the order"
+      - name: "user_id"
+        type: "integer"
+        nullable: false
+        foreign_key: "User.id"
+        index: true
+        description: "Foreign key to the ordering User"
+      - name: "created_at"
+        type: "datetime"
+        nullable: false
+        server_default: "now()"
+      - name: "updated_at"
+        type: "datetime"
+        nullable: true
+        onupdate: "now()"
+    relationships:
+      - name: "user"
+        target: "User"
+        type: "many-to-one"
+        back_populates: "orders"
+      - name: "items"
+        target: "OrderItem"
+        type: "one-to-many"
+        back_populates: "order"
+        cascade: "all, delete-orphan"
+
+  - name: "OrderItem"
+    description: "Individual line items within an order"
+    columns:
+      - name: "id"
+        type: "integer"
+        primary_key: true
+        autoincrement: true
+      - name: "quantity"
+        type: "integer"
+        nullable: false
+        default: 1
+        description: "Quantity of the product ordered"
+      - name: "unit_price"
+        type: "float"
+        nullable: false
+        description: "Price per unit at time of order"
+      - name: "subtotal"
+        type: "float"
+        nullable: false
+        description: "Line item subtotal (quantity * unit_price)"
+      - name: "order_id"
+        type: "integer"
+        nullable: false
+        foreign_key: "Order.id"
+        index: true
+        description: "Foreign key to parent Order"
+      - name: "product_id"
+        type: "integer"
+        nullable: false
+        foreign_key: "Product.id"
+        index: true
+        description: "Foreign key to the Product"
+      - name: "created_at"
+        type: "datetime"
+        nullable: false
+        server_default: "now()"
+    relationships:
+      - name: "order"
+        target: "Order"
+        type: "many-to-one"
+        back_populates: "items"
+      - name: "product"
+        target: "Product"
+        type: "many-to-one"
+        back_populates: "order_items"
+
+  - name: "Review"
+    description: "Product reviews submitted by users"
+    columns:
+      - name: "id"
+        type: "integer"
+        primary_key: true
+        autoincrement: true
+      - name: "rating"
+        type: "integer"
+        nullable: false
+        description: "Rating from 1 to 5"
+      - name: "title"
+        type: "string"
+        max_length: 200
+        nullable: true
+        description: "Review title/headline"
+      - name: "body"
+        type: "text"
+        nullable: true
+        description: "Full review text"
+      - name: "is_verified_purchase"
+        type: "boolean"
+        default: false
+        nullable: false
+        description: "Whether reviewer actually purchased the product"
+      - name: "user_id"
+        type: "integer"
+        nullable: false
+        foreign_key: "User.id"
+        index: true
+        description: "Foreign key to the reviewing User"
+      - name: "product_id"
+        type: "integer"
+        nullable: false
+        foreign_key: "Product.id"
+        index: true
+        description: "Foreign key to the reviewed Product"
+      - name: "created_at"
+        type: "datetime"
+        nullable: false
+        server_default: "now()"
+      - name: "updated_at"
+        type: "datetime"
+        nullable: true
+        onupdate: "now()"
+    relationships:
+      - name: "user"
+        target: "User"
+        type: "many-to-one"
+        back_populates: "reviews"
+      - name: "product"
+        target: "Product"
+        type: "many-to-one"
+        back_populates: "reviews"
