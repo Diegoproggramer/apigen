@@ -1,913 +1,1224 @@
+# File: apigen/validators.py
 """
-APIGen - Validation System
-Comprehensive input validation for models, fields, configs and project structure.
+NexaFlow APIGen - Schema & Configuration Validators
+=====================================================
+This module provides a **pure-function validation pipeline** that operates
+on the Pydantic V2 models defined in ``apigen.models``.
+
+Pydantic's built-in validators handle per-field and per-model structural
+correctness.  This module adds **cross-entity semantic validation**: FK
+target resolution, circular dependency detection, naming convention
+compliance, configuration sanity checks, and more.
+
+All functions are designed as O(n) single-pass algorithms where n is the
+total number of entities (tables, columns, FKs, etc.).
+
+Usage by downstream modules:
+    from apigen.validators import validate_full
+    errors = validate_full(schema_def, generation_config)
+    if errors:
+        raise SystemExit(...)
 """
 
+from __future__ import annotations
+
+import logging
 import re
-import os
-import keyword
-from typing import Any, Dict, List, Optional, Tuple, Set
-from dataclasses import dataclass, field
-from enum import Enum
+from collections import defaultdict, deque
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Set, Tuple
+
+from apigen.models import (
+    AuthStrategy,
+    ColumnInfo,
+    ColumnType,
+    CRUDConfig,
+    DatabaseDialect,
+    EnumDefinition,
+    ForeignKeyInfo,
+    GenerationConfig,
+    IndexInfo,
+    NamingConvention,
+    RelationshipInfo,
+    RelationshipType,
+    SchemaDefinition,
+    TableInfo,
+    UniqueConstraintInfo,
+)
+
+# ---------------------------------------------------------------------------
+# Logger
+# ---------------------------------------------------------------------------
+logger: logging.Logger = logging.getLogger("apigen.validators")
+
+# ---------------------------------------------------------------------------
+# Validation result container
+# ---------------------------------------------------------------------------
 
 
-# ============================================================
-# VALIDATION RESULT
-# ============================================================
+class ValidationError:
+    """Lightweight error descriptor (no Pydantic overhead)."""
 
-class Severity(Enum):
-    """Validation message severity levels."""
-    ERROR = "error"
-    WARNING = "warning"
-    INFO = "info"
+    __slots__ = ("level", "code", "message", "context")
 
+    def __init__(
+        self,
+        level: str,
+        code: str,
+        message: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.level: str = level  # "error" | "warning" | "info"
+        self.code: str = code
+        self.message: str = message
+        self.context: Dict[str, Any] = context or {}
 
-@dataclass
-class ValidationMessage:
-    """Single validation message."""
-    severity: Severity
-    code: str
-    message: str
-    field_name: Optional[str] = None
-    suggestion: Optional[str] = None
-    
+    @property
+    def is_error(self) -> bool:
+        return self.level == "error"
+
+    @property
+    def is_warning(self) -> bool:
+        return self.level == "warning"
+
+    def __repr__(self) -> str:
+        return f"[{self.level.upper()}] {self.code}: {self.message}"
+
     def __str__(self) -> str:
-        prefix = {
-            Severity.ERROR: "❌ ERROR",
-            Severity.WARNING: "⚠️  WARN",
-            Severity.INFO: "ℹ️  INFO",
-        }[self.severity]
-        
-        location = f" [{self.field_name}]" if self.field_name else ""
-        hint = f"\n   💡 Suggestion: {self.suggestion}" if self.suggestion else ""
-        return f"{prefix}{location}: {self.message}{hint}"
+        return self.__repr__()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "level": self.level,
+            "code": self.code,
+            "message": self.message,
+            "context": self.context,
+        }
 
 
-@dataclass
 class ValidationResult:
-    """Collection of validation messages."""
-    messages: List[ValidationMessage] = field(default_factory=list)
-    
+    """
+    Accumulates ``ValidationError`` instances produced by the pipeline.
+
+    Provides O(1) access to counts and O(n) filtering.
+    """
+
+    __slots__ = ("_items",)
+
+    def __init__(self) -> None:
+        self._items: List[ValidationError] = []
+
+    # -- Mutation -----------------------------------------------------------
+
+    def add_error(
+        self,
+        code: str,
+        message: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self._items.append(ValidationError("error", code, message, context))
+
+    def add_warning(
+        self,
+        code: str,
+        message: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self._items.append(ValidationError("warning", code, message, context))
+
+    def add_info(
+        self,
+        code: str,
+        message: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self._items.append(ValidationError("info", code, message, context))
+
+    def merge(self, other: "ValidationResult") -> None:
+        """Merge another result into this one — O(k) where k = len(other)."""
+        self._items.extend(other._items)
+
+    # -- Query --------------------------------------------------------------
+
     @property
-    def is_valid(self) -> bool:
-        """Check if no errors exist."""
-        return not any(m.severity == Severity.ERROR for m in self.messages)
-    
+    def errors(self) -> List[ValidationError]:
+        return [e for e in self._items if e.is_error]
+
     @property
-    def errors(self) -> List[ValidationMessage]:
-        """Get only error messages."""
-        return [m for m in self.messages if m.severity == Severity.ERROR]
-    
+    def warnings(self) -> List[ValidationError]:
+        return [e for e in self._items if e.is_warning]
+
     @property
-    def warnings(self) -> List[ValidationMessage]:
-        """Get only warning messages."""
-        return [m for m in self.messages if m.severity == Severity.WARNING]
-    
+    def all_items(self) -> List[ValidationError]:
+        return list(self._items)
+
+    @property
+    def has_errors(self) -> bool:
+        return any(e.is_error for e in self._items)
+
+    @property
+    def has_warnings(self) -> bool:
+        return any(e.is_warning for e in self._items)
+
     @property
     def error_count(self) -> int:
-        return len(self.errors)
-    
+        return sum(1 for e in self._items if e.is_error)
+
     @property
     def warning_count(self) -> int:
-        return len(self.warnings)
-    
-    def add_error(self, code: str, message: str, 
-                  field_name: str = None, suggestion: str = None):
-        """Add an error message."""
-        self.messages.append(ValidationMessage(
-            Severity.ERROR, code, message, field_name, suggestion
-        ))
-    
-    def add_warning(self, code: str, message: str,
-                    field_name: str = None, suggestion: str = None):
-        """Add a warning message."""
-        self.messages.append(ValidationMessage(
-            Severity.WARNING, code, message, field_name, suggestion
-        ))
-    
-    def add_info(self, code: str, message: str,
-                 field_name: str = None, suggestion: str = None):
-        """Add an info message."""
-        self.messages.append(ValidationMessage(
-            Severity.INFO, code, message, field_name, suggestion
-        ))
-    
-    def merge(self, other: 'ValidationResult'):
-        """Merge another validation result into this one."""
-        self.messages.extend(other.messages)
-    
+        return sum(1 for e in self._items if e.is_warning)
+
+    @property
+    def is_valid(self) -> bool:
+        return not self.has_errors
+
     def summary(self) -> str:
-        """Get a summary of validation results."""
-        lines = []
-        lines.append("=" * 50)
-        lines.append("  VALIDATION REPORT")
-        lines.append("=" * 50)
-        
-        if self.is_valid:
-            lines.append("  ✅ All validations passed!")
-        else:
-            lines.append(f"  ❌ Found {self.error_count} error(s)")
-        
-        if self.warning_count > 0:
-            lines.append(f"  ⚠️  Found {self.warning_count} warning(s)")
-        
-        lines.append("-" * 50)
-        
-        for msg in self.messages:
-            lines.append(f"  {msg}")
-        
-        lines.append("=" * 50)
+        return (
+            f"Validation: {self.error_count} error(s), "
+            f"{self.warning_count} warning(s), "
+            f"{len(self._items)} total item(s)."
+        )
+
+    def __repr__(self) -> str:
+        return f"<ValidationResult {self.summary()}>"
+
+    def __bool__(self) -> bool:
+        """Truthy when there are NO errors (i.e. valid)."""
+        return self.is_valid
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def format_report(self, include_info: bool = False) -> str:
+        """Human-readable multi-line report."""
+        lines: List[str] = [self.summary(), ""]
+        for item in self._items:
+            if not include_info and item.level == "info":
+                continue
+            prefix: str = {
+                "error": "❌",
+                "warning": "⚠️",
+                "info": "ℹ️",
+            }.get(item.level, "•")
+            lines.append(f"  {prefix} [{item.code}] {item.message}")
+            if item.context:
+                for k, v in item.context.items():
+                    lines.append(f"       {k}: {v}")
         return "\n".join(lines)
 
 
-# ============================================================
-# NAME VALIDATORS
-# ============================================================
+# ---------------------------------------------------------------------------
+# Regex patterns (compiled once at module load — O(1) per use)
+# ---------------------------------------------------------------------------
 
-# Python reserved keywords that can't be used as names
-PYTHON_RESERVED: Set[str] = set(keyword.kwlist)
+_SNAKE_CASE_RE: re.Pattern[str] = re.compile(r"^[a-z][a-z0-9]*(_[a-z0-9]+)*$")
+_PASCAL_CASE_RE: re.Pattern[str] = re.compile(r"^[A-Z][a-zA-Z0-9]*$")
+_IDENTIFIER_RE: re.Pattern[str] = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+_SEMANTIC_VERSION_RE: re.Pattern[str] = re.compile(
+    r"^\d+\.\d+\.\d+([a-zA-Z0-9\.\-]+)?$"
+)
 
-# SQLAlchemy / database reserved words
-SQL_RESERVED: Set[str] = {
-    'select', 'insert', 'update', 'delete', 'create', 'drop', 'alter',
-    'table', 'column', 'index', 'constraint', 'primary', 'foreign',
-    'key', 'references', 'join', 'inner', 'outer', 'left', 'right',
-    'where', 'group', 'order', 'having', 'limit', 'offset', 'union',
-    'distinct', 'as', 'on', 'and', 'or', 'not', 'null', 'true', 'false',
-    'between', 'like', 'in', 'exists', 'case', 'when', 'then', 'else',
-    'end', 'count', 'sum', 'avg', 'min', 'max', 'all', 'any', 'some',
-    'database', 'schema', 'grant', 'revoke', 'commit', 'rollback',
-    'transaction', 'begin', 'declare', 'cursor', 'fetch', 'into',
-    'values', 'set', 'from', 'user', 'role', 'view', 'trigger',
-    'procedure', 'function', 'exec', 'execute',
+# SQL reserved words that must not be used as identifiers (subset of most common)
+_SQL_RESERVED_WORDS: FrozenSet[str] = frozenset(
+    {
+        "select", "insert", "update", "delete", "drop", "create", "alter",
+        "table", "column", "index", "from", "where", "join", "inner",
+        "outer", "left", "right", "on", "and", "or", "not", "null",
+        "true", "false", "in", "between", "like", "is", "as", "order",
+        "by", "group", "having", "limit", "offset", "union", "all",
+        "distinct", "case", "when", "then", "else", "end", "exists",
+        "primary", "foreign", "key", "references", "constraint", "check",
+        "default", "unique", "cascade", "set", "values", "into",
+        "grant", "revoke", "begin", "commit", "rollback", "transaction",
+        "user", "role", "schema", "database", "trigger", "procedure",
+        "function", "view", "sequence", "type", "enum", "domain",
+        "return", "returns", "declare", "execute", "fetch", "cursor",
+        "open", "close", "deallocate", "prepare", "with", "recursive",
+    }
+)
+
+# Python reserved / built-in names to avoid in generated code
+_PYTHON_RESERVED_WORDS: FrozenSet[str] = frozenset(
+    {
+        "False", "None", "True", "and", "as", "assert", "async", "await",
+        "break", "class", "continue", "def", "del", "elif", "else",
+        "except", "finally", "for", "from", "global", "if", "import",
+        "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise",
+        "return", "try", "while", "with", "yield",
+        "id", "type", "list", "dict", "set", "str", "int", "float",
+        "bool", "bytes", "object", "print", "input", "range", "len",
+        "map", "filter", "zip", "enumerate", "super", "property",
+        "staticmethod", "classmethod", "hash", "help", "dir", "vars",
+        "getattr", "setattr", "delattr", "hasattr", "isinstance",
+        "issubclass", "callable", "repr", "format", "iter", "next",
+        "open", "file", "exec", "eval", "compile",
+    }
+)
+
+# Dialect-specific type restrictions
+_DIALECT_UNSUPPORTED_TYPES: Dict[str, FrozenSet[str]] = {
+    "sqlite": frozenset({"jsonb", "hstore", "inet", "cidr", "macaddr", "array"}),
+    "mysql": frozenset({"jsonb", "hstore", "inet", "cidr", "macaddr"}),
+    "mssql": frozenset({"jsonb", "hstore", "inet", "cidr", "macaddr", "array"}),
+    "oracle": frozenset({"jsonb", "hstore", "inet", "cidr", "macaddr", "array"}),
+    "postgresql": frozenset(),  # supports everything
 }
 
-# FastAPI / Pydantic reserved names
-FASTAPI_RESERVED: Set[str] = {
-    'request', 'response', 'app', 'router', 'middleware',
-    'dependency', 'background', 'websocket', 'config',
-    'basemodel', 'field', 'validator', 'root_validator',
-    'base', 'metadata', 'query', 'body', 'path', 'header', 'cookie',
-}
 
-# Common model names that might cause conflicts
-RISKY_MODEL_NAMES: Set[str] = {
-    'type', 'model', 'object', 'list', 'dict', 'set', 'str', 'int',
-    'float', 'bool', 'bytes', 'tuple', 'base', 'session', 'engine',
-    'connection', 'metadata', 'table', 'column', 'query',
-}
+# ---------------------------------------------------------------------------
+# Individual validation functions (each is O(n) or better)
+# ---------------------------------------------------------------------------
 
 
-class NameValidator:
-    """Validates names for models, fields, and projects."""
-    
-    # Valid Python identifier pattern
-    IDENTIFIER_PATTERN = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
-    
-    # PascalCase pattern for model names
-    PASCAL_CASE_PATTERN = re.compile(r'^[A-Z][a-zA-Z0-9]*$')
-    
-    # snake_case pattern for field names
-    SNAKE_CASE_PATTERN = re.compile(r'^[a-z][a-z0-9_]*$')
-    
-    # Project name pattern (allows hyphens)
-    PROJECT_NAME_PATTERN = re.compile(r'^[a-z][a-z0-9_-]*$')
-    
-    @classmethod
-    def validate_model_name(cls, name: str, result: ValidationResult) -> bool:
-        """Validate a model/class name."""
-        if not name:
-            result.add_error("E001", "Model name cannot be empty", "model_name")
-            return False
-        
-        if len(name) < 2:
+def validate_table_names(schema: SchemaDefinition) -> ValidationResult:
+    """
+    Validate all table names for:
+    - Valid Python / SQL identifier format
+    - snake_case convention
+    - No SQL reserved words
+    - No Python reserved words
+    - No duplicates (also checked by Pydantic, belt-and-suspenders)
+
+    Complexity: O(T) where T = number of tables.
+    """
+    result: ValidationResult = ValidationResult()
+    seen: Set[str] = set()
+
+    for table in schema.tables:
+        name: str = table.name
+        ctx: Dict[str, Any] = {"table": name}
+
+        # Duplicate check
+        if name in seen:
             result.add_error(
-                "E002", f"Model name '{name}' is too short (min 2 chars)",
-                "model_name", "Use descriptive names like 'User', 'Product', 'BlogPost'"
+                "DUPLICATE_TABLE_NAME",
+                f"Table name '{name}' is defined more than once.",
+                ctx,
             )
-            return False
-        
-        if len(name) > 64:
+        seen.add(name)
+
+        # Valid identifier
+        if not _IDENTIFIER_RE.match(name):
             result.add_error(
-                "E003", f"Model name '{name}' is too long (max 64 chars)",
-                "model_name"
+                "INVALID_TABLE_NAME",
+                f"Table name '{name}' is not a valid identifier.",
+                ctx,
             )
-            return False
-        
-        if not cls.IDENTIFIER_PATTERN.match(name):
-            result.add_error(
-                "E004", f"Model name '{name}' is not a valid Python identifier",
-                "model_name", "Use only letters, numbers, and underscores"
-            )
-            return False
-        
-        if not cls.PASCAL_CASE_PATTERN.match(name):
+            continue  # skip further checks for this name
+
+        # Snake case
+        if not _SNAKE_CASE_RE.match(name):
             result.add_warning(
-                "W001", f"Model name '{name}' should be PascalCase",
-                "model_name",
-                f"Suggested: '{cls._to_pascal_case(name)}'"
+                "TABLE_NAME_NOT_SNAKE_CASE",
+                f"Table name '{name}' is not snake_case. "
+                f"Generated class name may look odd.",
+                ctx,
             )
-        
-        name_lower = name.lower()
-        
-        if name_lower in PYTHON_RESERVED:
+
+        # SQL reserved
+        if name.lower() in _SQL_RESERVED_WORDS:
             result.add_error(
-                "E005", f"'{name}' is a Python reserved keyword",
-                "model_name", f"Try '{name}Item' or '{name}Model' instead"
+                "TABLE_NAME_SQL_RESERVED",
+                f"Table name '{name}' is a SQL reserved word.",
+                ctx,
             )
-            return False
-        
-        if name_lower in RISKY_MODEL_NAMES:
-            result.add_warning(
-                "W002", f"'{name}' may conflict with built-in types",
-                "model_name", f"Consider using a more specific name like 'App{name}'"
-            )
-        
-        if name.endswith('s') and not name.endswith('ss'):
-            result.add_warning(
-                "W003", f"Model name '{name}' appears to be plural",
-                "model_name",
-                f"Model names should be singular. Suggested: '{name.rstrip('s')}'"
-            )
-        
-        return True
-    
-    @classmethod
-    def validate_field_name(cls, name: str, model_name: str,
-                            result: ValidationResult) -> bool:
-        """Validate a field/column name."""
-        if not name:
+
+        # Python reserved
+        if name in _PYTHON_RESERVED_WORDS:
             result.add_error(
-                "E010", "Field name cannot be empty",
-                f"{model_name}.field_name"
+                "TABLE_NAME_PYTHON_RESERVED",
+                f"Table name '{name}' clashes with a Python reserved word.",
+                ctx,
             )
-            return False
-        
-        if len(name) > 64:
-            result.add_error(
-                "E011", f"Field name '{name}' is too long (max 64 chars)",
-                f"{model_name}.{name}"
-            )
-            return False
-        
-        if not cls.IDENTIFIER_PATTERN.match(name):
-            result.add_error(
-                "E012", f"Field name '{name}' is not a valid Python identifier",
-                f"{model_name}.{name}"
-            )
-            return False
-        
-        if not cls.SNAKE_CASE_PATTERN.match(name):
-            result.add_warning(
-                "W010", f"Field name '{name}' should be snake_case",
-                f"{model_name}.{name}",
-                f"Suggested: '{cls._to_snake_case(name)}'"
-            )
-        
-        if name.lower() in PYTHON_RESERVED:
-            result.add_error(
-                "E013", f"Field '{name}' is a Python reserved keyword",
-                f"{model_name}.{name}",
-                f"Try '{name}_value' or '{name}_field' instead"
-            )
-            return False
-        
-        if name.lower() in SQL_RESERVED:
-            result.add_warning(
-                "W011", f"Field '{name}' is a SQL reserved word",
-                f"{model_name}.{name}",
-                "This may cause issues with some databases"
-            )
-        
-        if name.startswith('_'):
-            result.add_warning(
-                "W012", f"Field '{name}' starts with underscore",
-                f"{model_name}.{name}",
-                "Leading underscores are typically reserved for internal use"
-            )
-        
-        return True
-    
-    @classmethod
-    def validate_project_name(cls, name: str, result: ValidationResult) -> bool:
-        """Validate a project name."""
-        if not name:
-            result.add_error("E020", "Project name cannot be empty", "project_name")
-            return False
-        
-        if len(name) < 2:
-            result.add_error(
-                "E021", f"Project name '{name}' is too short (min 2 chars)",
-                "project_name"
-            )
-            return False
-        
-        if len(name) > 100:
-            result.add_error(
-                "E022", f"Project name '{name}' is too long (max 100 chars)",
-                "project_name"
-            )
-            return False
-        
-        if not cls.PROJECT_NAME_PATTERN.match(name):
-            result.add_error(
-                "E023", f"Project name '{name}' has invalid characters",
-                "project_name",
-                "Use only lowercase letters, numbers, hyphens, and underscores"
-            )
-            return False
-        
-        if name.lower() in PYTHON_RESERVED:
-            result.add_error(
-                "E024", f"Project name '{name}' is a Python reserved keyword",
-                "project_name"
-            )
-            return False
-        
-        return True
-    
-    @classmethod
-    def validate_endpoint_path(cls, path: str, result: ValidationResult) -> bool:
-        """Validate an API endpoint path."""
-        if not path:
-            result.add_error("E030", "Endpoint path cannot be empty", "path")
-            return False
-        
-        if not path.startswith('/'):
-            result.add_warning(
-                "W030", f"Path '{path}' should start with '/'",
-                "path", f"Suggested: '/{path}'"
-            )
-        
-        valid_path = re.compile(r'^(/[a-z0-9_-]+|\{[a-z_][a-z0-9_]*\})*/?$', re.IGNORECASE)
-        clean_path = path if path.startswith('/') else f'/{path}'
-        
-        if not valid_path.match(clean_path):
-            result.add_warning(
-                "W031", f"Path '{path}' may contain invalid characters",
-                "path", "Use lowercase letters, numbers, hyphens in paths"
-            )
-        
-        return True
-    
-    @staticmethod
-    def _to_pascal_case(name: str) -> str:
-        """Convert string to PascalCase."""
-        if '_' in name:
-            return ''.join(w.capitalize() for w in name.split('_'))
-        if '-' in name:
-            return ''.join(w.capitalize() for w in name.split('-'))
-        return name[0].upper() + name[1:] if name else name
-    
-    @staticmethod
-    def _to_snake_case(name: str) -> str:
-        """Convert string to snake_case."""
-        s1 = re.sub(r'(.)([A-Z][a-z]+)', r'\1_\2', name)
-        return re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
+
+    logger.debug(
+        "validate_table_names: checked %d tables, %d issue(s).",
+        len(schema.tables),
+        len(result),
+    )
+    return result
 
 
-# ============================================================
-# MODEL VALIDATOR
-# ============================================================
+def validate_column_names(schema: SchemaDefinition) -> ValidationResult:
+    """
+    Validate every column name across all tables.
 
-class ModelValidator:
-    """Validates complete model definitions."""
-    
-    # Sensible limits
-    MAX_FIELDS_PER_MODEL = 100
-    MAX_RELATIONSHIPS_PER_MODEL = 20
-    MAX_INDEXES_PER_MODEL = 30
-    
-    @classmethod
-    def validate(cls, model_dict: Dict[str, Any]) -> ValidationResult:
-        """Validate a complete model definition dict."""
-        result = ValidationResult()
-        
-        # Validate model name
-        name = model_dict.get('name', '')
-        NameValidator.validate_model_name(name, result)
-        
-        # Validate fields
-        fields = model_dict.get('fields', [])
-        cls._validate_fields(name, fields, result)
-        
-        # Validate relationships
-        relationships = model_dict.get('relationships', [])
-        cls._validate_relationships(name, relationships, result)
-        
-        # Check model-level constraints
-        cls._validate_model_constraints(model_dict, result)
-        
-        return result
-    
-    @classmethod
-    def validate_model_object(cls, model) -> ValidationResult:
-        """Validate a DatabaseModel object."""
-        result = ValidationResult()
-        
-        NameValidator.validate_model_name(model.name, result)
-        
-        if len(model.fields) == 0:
+    Complexity: O(C) where C = total number of columns.
+    """
+    result: ValidationResult = ValidationResult()
+
+    for table in schema.tables:
+        col_names_seen: Set[str] = set()
+        for col in table.columns:
+            ctx: Dict[str, Any] = {"table": table.name, "column": col.name}
+
+            # Duplicate within table
+            if col.name in col_names_seen:
+                result.add_error(
+                    "DUPLICATE_COLUMN_NAME",
+                    f"Column '{col.name}' is duplicated in table '{table.name}'.",
+                    ctx,
+                )
+            col_names_seen.add(col.name)
+
+            # Valid identifier
+            if not _IDENTIFIER_RE.match(col.name):
+                result.add_error(
+                    "INVALID_COLUMN_NAME",
+                    f"Column '{col.name}' in table '{table.name}' "
+                    f"is not a valid identifier.",
+                    ctx,
+                )
+                continue
+
+            # Snake case
+            if not _SNAKE_CASE_RE.match(col.name):
+                result.add_warning(
+                    "COLUMN_NAME_NOT_SNAKE_CASE",
+                    f"Column '{col.name}' in table '{table.name}' "
+                    f"is not snake_case.",
+                    ctx,
+                )
+
+            # Python reserved
+            if col.name in _PYTHON_RESERVED_WORDS:
+                result.add_warning(
+                    "COLUMN_NAME_PYTHON_RESERVED",
+                    f"Column '{col.name}' in table '{table.name}' "
+                    f"clashes with Python built-in. "
+                    f"Generated code will use '{col.name}_' suffix.",
+                    ctx,
+                )
+
+            # SQL reserved
+            if col.name.lower() in _SQL_RESERVED_WORDS:
+                result.add_warning(
+                    "COLUMN_NAME_SQL_RESERVED",
+                    f"Column '{col.name}' in table '{table.name}' "
+                    f"is a SQL reserved word. Quoting will be applied.",
+                    ctx,
+                )
+
+    logger.debug("validate_column_names: completed for %d tables.", len(schema.tables))
+    return result
+
+
+def validate_primary_keys(schema: SchemaDefinition) -> ValidationResult:
+    """
+    Ensure every table has at least one primary key column.
+
+    Complexity: O(T) where T = number of tables.
+    """
+    result: ValidationResult = ValidationResult()
+
+    for table in schema.tables:
+        pk_cols: List[str] = table.resolved_primary_keys
+        ctx: Dict[str, Any] = {"table": table.name}
+
+        if not pk_cols:
             result.add_error(
-                "E100", f"Model '{model.name}' has no fields",
-                model.name, "Add at least one field to the model"
+                "MISSING_PRIMARY_KEY",
+                f"Table '{table.name}' has no primary key. "
+                f"Every generated ORM model requires at least one PK column.",
+                ctx,
             )
-        
-        if len(model.fields) > cls.MAX_FIELDS_PER_MODEL:
-            result.add_warning(
-                "W100", f"Model '{model.name}' has {len(model.fields)} fields (max recommended: {cls.MAX_FIELDS_PER_MODEL})",
-                model.name, "Consider splitting into multiple models"
-            )
-        
-        # Check for duplicate field names
-        field_names = [f.name for f in model.fields]
-        duplicates = [n for n in field_names if field_names.count(n) > 1]
-        if duplicates:
-            result.add_error(
-                "E101", f"Duplicate field names in '{model.name}': {set(duplicates)}",
-                model.name
-            )
-        
-        # Validate each field
-        for f in model.fields:
-            NameValidator.validate_field_name(f.name, model.name, result)
-        
-        # Validate relationships
-        if len(model.relationships) > cls.MAX_RELATIONSHIPS_PER_MODEL:
-            result.add_warning(
-                "W101", f"Model '{model.name}' has too many relationships ({len(model.relationships)})",
-                model.name
-            )
-        
-        # Check auth model has required fields
-        if model.is_auth_model:
-            auth_field_names = {f.name for f in model.fields}
-            required_auth = {'email', 'hashed_password'}
-            missing = required_auth - auth_field_names
+            continue
+
+        # Verify PK columns actually exist in the table
+        col_set: Set[str] = {c.name for c in table.columns}
+        for pk in pk_cols:
+            if pk not in col_set:
+                result.add_error(
+                    "PK_COLUMN_NOT_FOUND",
+                    f"Primary key column '{pk}' declared for table "
+                    f"'{table.name}' does not exist in columns list.",
+                    {"table": table.name, "pk_column": pk},
+                )
+
+        # Warn on nullable PK
+        for col in table.columns:
+            if col.primary_key and col.nullable:
+                result.add_warning(
+                    "NULLABLE_PRIMARY_KEY",
+                    f"PK column '{col.name}' in table '{table.name}' "
+                    f"is marked nullable — this is usually a mistake.",
+                    {"table": table.name, "column": col.name},
+                )
+
+    return result
+
+
+def validate_foreign_keys(schema: SchemaDefinition) -> ValidationResult:
+    """
+    Cross-table FK validation:
+    - Referred table exists
+    - Referred column exists in referred table
+    - Constrained column type is compatible with referred column type
+    - No self-referential FK to a non-existent column
+
+    Complexity: O(T + F) where F = total foreign keys.
+    """
+    result: ValidationResult = ValidationResult()
+
+    # Build global column type map: (table_name, col_name) → ColumnType   O(C)
+    col_type_map: Dict[Tuple[str, str], ColumnType] = {}
+    for table in schema.tables:
+        for col in table.columns:
+            col_type_map[(table.name, col.name)] = col.column_type
+
+    table_names: Set[str] = {t.name for t in schema.tables}
+
+    for table in schema.tables:
+        for fk in table.foreign_keys:
+            ctx: Dict[str, Any] = {
+                "table": table.name,
+                "column": fk.constrained_column,
+                "referred_table": fk.referred_table,
+                "referred_column": fk.referred_column,
+            }
+
+            # Target table exists (also checked by Pydantic — belt-and-suspenders)
+            if fk.referred_table not in table_names:
+                result.add_error(
+                    "FK_TARGET_TABLE_MISSING",
+                    f"FK from '{table.name}.{fk.constrained_column}' → "
+                    f"'{fk.referred_table}.{fk.referred_column}': "
+                    f"table '{fk.referred_table}' does not exist.",
+                    ctx,
+                )
+                continue
+
+            # Target column exists
+            target_key: Tuple[str, str] = (fk.referred_table, fk.referred_column)
+            if target_key not in col_type_map:
+                result.add_error(
+                    "FK_TARGET_COLUMN_MISSING",
+                    f"FK from '{table.name}.{fk.constrained_column}' → "
+                    f"'{fk.referred_table}.{fk.referred_column}': "
+                    f"column '{fk.referred_column}' not found in "
+                    f"'{fk.referred_table}'.",
+                    ctx,
+                )
+                continue
+
+            # Type compatibility check
+            source_key: Tuple[str, str] = (table.name, fk.constrained_column)
+            source_type: Optional[ColumnType] = col_type_map.get(source_key)
+            target_type: ColumnType = col_type_map[target_key]
+
+            if source_type is not None and source_type != target_type:
+                # Allow compatible pairings (e.g. integer ↔ biginteger)
+                compatible_groups: List[FrozenSet[ColumnType]] = [
+                    frozenset({
+                        ColumnType.INTEGER,
+                        ColumnType.BIGINTEGER,
+                        ColumnType.SMALLINTEGER,
+                    }),
+                    frozenset({
+                        ColumnType.STRING,
+                        ColumnType.VARCHAR,
+                        ColumnType.CHAR,
+                        ColumnType.TEXT,
+                    }),
+                    frozenset({
+                        ColumnType.FLOAT,
+                        ColumnType.DOUBLE,
+                        ColumnType.NUMERIC,
+                    }),
+                    frozenset({
+                        ColumnType.DATETIME,
+                        ColumnType.TIMESTAMP,
+                    }),
+                ]
+                is_compatible: bool = any(
+                    source_type in group and target_type in group
+                    for group in compatible_groups
+                )
+                if not is_compatible:
+                    result.add_warning(
+                        "FK_TYPE_MISMATCH",
+                        f"FK '{table.name}.{fk.constrained_column}' "
+                        f"(type={source_type}) → "
+                        f"'{fk.referred_table}.{fk.referred_column}' "
+                        f"(type={target_type}): types may be incompatible.",
+                        ctx,
+                    )
+
+    return result
+
+
+def validate_relationships(schema: SchemaDefinition) -> ValidationResult:
+    """
+    Validate ORM relationship definitions:
+    - Target table exists
+    - Underlying FK is valid
+    - M2M relationships have a secondary table
+    - back_populates targets are consistent
+
+    Complexity: O(T + R) where R = total relationships.
+    """
+    result: ValidationResult = ValidationResult()
+    table_names: Set[str] = {t.name for t in schema.tables}
+
+    # Build reverse map: (table_name, rel_name) → RelationshipInfo    O(R)
+    rel_map: Dict[Tuple[str, str], RelationshipInfo] = {}
+    for table in schema.tables:
+        for rel in table.relationships:
+            rel_map[(table.name, rel.name)] = rel
+
+    for table in schema.tables:
+        for rel in table.relationships:
+            ctx: Dict[str, Any] = {
+                "table": table.name,
+                "relationship": rel.name,
+                "target": rel.target_table,
+            }
+
+            # Target table
+            if rel.target_table not in table_names:
+                result.add_error(
+                    "REL_TARGET_TABLE_MISSING",
+                    f"Relationship '{rel.name}' on table '{table.name}' "
+                    f"targets non-existent table '{rel.target_table}'.",
+                    ctx,
+                )
+                continue
+
+            # M2M must have secondary
+            if (
+                rel.relationship_type == RelationshipType.MANY_TO_MANY
+                and not rel.secondary_table
+            ):
+                result.add_error(
+                    "M2M_MISSING_SECONDARY",
+                    f"Many-to-many relationship '{rel.name}' on "
+                    f"'{table.name}' is missing 'secondary_table'.",
+                    ctx,
+                )
+
+            # If secondary_table is specified, it must exist
+            if rel.secondary_table and rel.secondary_table not in table_names:
+                result.add_error(
+                    "REL_SECONDARY_TABLE_MISSING",
+                    f"Relationship '{rel.name}' on '{table.name}' "
+                    f"references secondary table '{rel.secondary_table}' "
+                    f"which does not exist.",
+                    ctx,
+                )
+
+            # back_populates consistency
+            if rel.back_populates:
+                reverse_key: Tuple[str, str] = (
+                    rel.target_table,
+                    rel.back_populates,
+                )
+                reverse_rel: Optional[RelationshipInfo] = rel_map.get(reverse_key)
+                if reverse_rel is None:
+                    result.add_warning(
+                        "REL_BACK_POPULATES_MISSING",
+                        f"Relationship '{rel.name}' on '{table.name}' "
+                        f"sets back_populates='{rel.back_populates}' but "
+                        f"no such relationship exists on '{rel.target_table}'.",
+                        ctx,
+                    )
+                elif reverse_rel.back_populates != rel.name:
+                    result.add_warning(
+                        "REL_BACK_POPULATES_MISMATCH",
+                        f"Relationship '{rel.name}' on '{table.name}' "
+                        f"(back_populates='{rel.back_populates}') and "
+                        f"'{reverse_rel.name}' on '{rel.target_table}' "
+                        f"(back_populates='{reverse_rel.back_populates}') "
+                        f"are not symmetrical.",
+                        ctx,
+                    )
+
+    return result
+
+
+def validate_indexes(schema: SchemaDefinition) -> ValidationResult:
+    """
+    Validate index definitions across all tables.
+
+    Complexity: O(T + I) where I = total indexes.
+    """
+    result: ValidationResult = ValidationResult()
+
+    for table in schema.tables:
+        idx_names_seen: Set[str] = set()
+        col_set: Set[str] = {c.name for c in table.columns}
+
+        for idx in table.indexes:
+            ctx: Dict[str, Any] = {
+                "table": table.name,
+                "index": idx.name,
+            }
+
+            # Duplicate index name within table
+            if idx.name in idx_names_seen:
+                result.add_warning(
+                    "DUPLICATE_INDEX_NAME",
+                    f"Index name '{idx.name}' appears more than once "
+                    f"in table '{table.name}'.",
+                    ctx,
+                )
+            idx_names_seen.add(idx.name)
+
+            # Column existence (also checked by Pydantic model_validator)
+            missing: List[str] = [c for c in idx.columns if c not in col_set]
             if missing:
                 result.add_error(
-                    "E102", f"Auth model '{model.name}' missing required fields: {missing}",
-                    model.name
+                    "INDEX_COLUMN_MISSING",
+                    f"Index '{idx.name}' on '{table.name}' references "
+                    f"non-existent column(s): {missing}.",
+                    ctx,
                 )
-        
-        # Info about auto-generated features
-        if model.timestamps:
-            result.add_info("I100", f"Timestamps enabled for '{model.name}'", model.name)
-        if model.soft_delete:
-            result.add_info("I101", f"Soft delete enabled for '{model.name}'", model.name)
-        
-        return result
-    
-    @classmethod
-    def _validate_fields(cls, model_name: str, fields: List[Dict],
-                         result: ValidationResult):
-        """Validate field definitions."""
-        if not fields:
-            result.add_warning(
-                "W110", f"Model '{model_name}' has no custom fields defined",
-                model_name, "Add fields to make the model useful"
-            )
-            return
-        
-        field_names = set()
-        has_primary_key = False
-        
-        for idx, f in enumerate(fields):
-            fname = f.get('name', '')
-            
-            if not fname:
-                result.add_error(
-                    "E110", f"Field #{idx + 1} in '{model_name}' has no name",
-                    model_name
-                )
-                continue
-            
-            # Check duplicates
-            if fname in field_names:
-                result.add_error(
-                    "E111", f"Duplicate field '{fname}' in '{model_name}'",
-                    f"{model_name}.{fname}"
-                )
-            field_names.add(fname)
-            
-            # Validate name
-            NameValidator.validate_field_name(fname, model_name, result)
-            
-            # Validate type
-            ftype = f.get('type', f.get('field_type', ''))
-            if ftype:
-                valid_types = {
-                    'string', 'text', 'integer', 'float', 'boolean',
-                    'datetime', 'date', 'email', 'url', 'uuid', 'json',
-                    'enum', 'file', 'image', 'password', 'phone', 'slug',
-                    'ip_address'
-                }
-                if isinstance(ftype, str) and ftype.lower() not in valid_types:
-                    result.add_error(
-                        "E112", f"Unknown field type '{ftype}' for '{model_name}.{fname}'",
-                        f"{model_name}.{fname}",
-                        f"Valid types: {', '.join(sorted(valid_types))}"
+
+            # Single-column unique index on a column already marked unique
+            if idx.unique and len(idx.columns) == 1:
+                col_name: str = idx.columns[0]
+                col_info: Optional[ColumnInfo] = table.get_column(col_name)
+                if col_info and col_info.unique:
+                    result.add_info(
+                        "REDUNDANT_UNIQUE_INDEX",
+                        f"Index '{idx.name}' is a unique index on column "
+                        f"'{col_name}' which is already marked unique. "
+                        f"This creates a redundant constraint.",
+                        ctx,
                     )
-            
-            # Check max_length for strings
-            max_len = f.get('max_length', 255)
-            if isinstance(max_len, int) and max_len > 10000:
-                result.add_warning(
-                    "W111", f"Very large max_length ({max_len}) for '{model_name}.{fname}'",
-                    f"{model_name}.{fname}",
-                    "Consider using 'text' type instead"
-                )
-            
-            # Check enum values
-            if ftype in ('enum', 'Enum') and not f.get('enum_values'):
-                result.add_error(
-                    "E113", f"Enum field '{model_name}.{fname}' has no values defined",
-                    f"{model_name}.{fname}",
-                    "Add enum_values=['value1', 'value2', ...]"
-                )
-            
-            if f.get('primary_key'):
-                has_primary_key = True
-    
-    @classmethod
-    def _validate_relationships(cls, model_name: str, relationships: List[Dict],
-                                result: ValidationResult):
-        """Validate relationship definitions."""
-        rel_names = set()
-        
-        for rel in relationships:
-            rname = rel.get('name', '')
-            
-            if not rname:
-                result.add_error(
-                    "E120", f"Relationship in '{model_name}' has no name",
-                    model_name
-                )
+
+    return result
+
+
+def validate_circular_dependencies(schema: SchemaDefinition) -> ValidationResult:
+    """
+    Detect circular FK dependency chains using iterative DFS.
+
+    Complexity: O(T + F) — standard cycle detection.
+    """
+    result: ValidationResult = ValidationResult()
+
+    # Adjacency list: table → set of tables it depends on
+    adjacency: Dict[str, Set[str]] = defaultdict(set)
+    for table in schema.tables:
+        for fk in table.foreign_keys:
+            if fk.referred_table != table.name:  # ignore self-ref for cycles
+                adjacency[table.name].add(fk.referred_table)
+
+    all_tables: Set[str] = {t.name for t in schema.tables}
+    visited: Set[str] = set()
+    in_stack: Set[str] = set()
+    cycles_found: List[List[str]] = []
+
+    for start in all_tables:
+        if start in visited:
+            continue
+
+        # Iterative DFS using an explicit stack
+        stack: List[Tuple[str, bool]] = [(start, False)]
+        path: List[str] = []
+
+        while stack:
+            node, is_returning = stack.pop()
+
+            if is_returning:
+                in_stack.discard(node)
+                if path and path[-1] == node:
+                    path.pop()
                 continue
-            
-            if rname in rel_names:
-                result.add_error(
-                    "E121", f"Duplicate relationship '{rname}' in '{model_name}'",
-                    f"{model_name}.{rname}"
+
+            if node in in_stack:
+                # Found a cycle — extract it
+                cycle_start_idx: int = (
+                    path.index(node) if node in path else len(path)
                 )
-            rel_names.add(rname)
-            
-            # Check target model
-            target = rel.get('target_model', rel.get('target', ''))
-            if not target:
+                cycle: List[str] = path[cycle_start_idx:] + [node]
+                cycles_found.append(cycle)
+                continue
+
+            if node in visited:
+                continue
+
+            visited.add(node)
+            in_stack.add(node)
+            path.append(node)
+
+            # Push return marker then neighbours
+            stack.append((node, True))
+            for neighbour in adjacency.get(node, set()):
+                stack.append((neighbour, False))
+
+    for cycle in cycles_found:
+        cycle_str: str = " → ".join(cycle)
+        result.add_warning(
+            "CIRCULAR_FK_DEPENDENCY",
+            f"Circular foreign-key dependency detected: {cycle_str}. "
+            f"Generated Alembic migrations may need manual ordering.",
+            {"cycle": cycle},
+        )
+
+    if not cycles_found:
+        logger.debug("No circular FK dependencies detected.")
+
+    return result
+
+
+def validate_dialect_compatibility(
+    schema: SchemaDefinition, config: GenerationConfig
+) -> ValidationResult:
+    """
+    Check that all column types used are supported by the target dialect.
+
+    Complexity: O(C) where C = total columns.
+    """
+    result: ValidationResult = ValidationResult()
+    dialect: str = config.database_dialect
+    unsupported: FrozenSet[str] = _DIALECT_UNSUPPORTED_TYPES.get(
+        dialect, frozenset()
+    )
+
+    if not unsupported:
+        return result  # nothing to check (e.g. PostgreSQL)
+
+    for table in schema.tables:
+        for col in table.columns:
+            if col.column_type in unsupported:
                 result.add_error(
-                    "E122", f"Relationship '{rname}' has no target model",
-                    f"{model_name}.{rname}"
+                    "DIALECT_UNSUPPORTED_TYPE",
+                    f"Column '{col.name}' in table '{table.name}' uses "
+                    f"type '{col.column_type}' which is not supported by "
+                    f"the '{dialect}' dialect.",
+                    {
+                        "table": table.name,
+                        "column": col.name,
+                        "type": col.column_type,
+                        "dialect": dialect,
+                    },
                 )
-            
-            # Check relation type
-            rel_type = rel.get('relation_type', rel.get('type', ''))
-            valid_rel_types = {
-                'one_to_one', 'one_to_many', 'many_to_one', 'many_to_many'
+
+    return result
+
+
+def validate_enum_definitions(schema: SchemaDefinition) -> ValidationResult:
+    """
+    Validate standalone enums and column-level enum definitions.
+
+    Complexity: O(E + C) where E = standalone enums, C = columns.
+    """
+    result: ValidationResult = ValidationResult()
+
+    # Standalone enums: unique names
+    enum_names_seen: Set[str] = set()
+    for enum_def in schema.enums:
+        if enum_def.name in enum_names_seen:
+            result.add_error(
+                "DUPLICATE_ENUM_NAME",
+                f"Enum type '{enum_def.name}' is defined more than once.",
+                {"enum": enum_def.name},
+            )
+        enum_names_seen.add(enum_def.name)
+
+        # Identifier check
+        if not _IDENTIFIER_RE.match(enum_def.name):
+            result.add_error(
+                "INVALID_ENUM_NAME",
+                f"Enum name '{enum_def.name}' is not a valid identifier.",
+                {"enum": enum_def.name},
+            )
+
+        # At least 1 value (also checked by Pydantic)
+        if not enum_def.values:
+            result.add_error(
+                "EMPTY_ENUM",
+                f"Enum '{enum_def.name}' has no values.",
+                {"enum": enum_def.name},
+            )
+
+    # Column-level enum checks
+    for table in schema.tables:
+        for col in table.columns:
+            if col.column_type == ColumnType.ENUM and col.enum_definition:
+                if not col.enum_definition.values:
+                    result.add_error(
+                        "EMPTY_COLUMN_ENUM",
+                        f"Column '{col.name}' in table '{table.name}' is "
+                        f"of type ENUM but has no values defined.",
+                        {"table": table.name, "column": col.name},
+                    )
+
+    return result
+
+
+def validate_generation_config(config: GenerationConfig) -> ValidationResult:
+    """
+    Validate the generation configuration model for semantic correctness
+    beyond what Pydantic field constraints enforce.
+
+    Complexity: O(1) (config is a fixed-size object).
+    """
+    result: ValidationResult = ValidationResult()
+
+    # Project name is a valid Python package name
+    if not _IDENTIFIER_RE.match(config.project_name):
+        result.add_error(
+            "INVALID_PROJECT_NAME",
+            f"Project name '{config.project_name}' is not a valid "
+            f"Python identifier / package name.",
+            {"project_name": config.project_name},
+        )
+
+    # Version looks like semver
+    if not _SEMANTIC_VERSION_RE.match(config.project_version):
+        result.add_warning(
+            "INVALID_SEMVER",
+            f"Project version '{config.project_version}' does not follow "
+            f"semantic versioning (e.g. 1.0.0).",
+            {"version": config.project_version},
+        )
+
+    # Async driver check for known dialects
+    if config.use_async:
+        async_driver_hints: Dict[str, str] = {
+            "postgresql": "asyncpg",
+            "mysql": "aiomysql",
+            "sqlite": "aiosqlite",
+        }
+        dialect: str = config.database_dialect
+        hint: Optional[str] = async_driver_hints.get(dialect)
+        if hint and hint not in config.database_url:
+            result.add_warning(
+                "ASYNC_DRIVER_MISSING",
+                f"use_async=True but database_url does not contain "
+                f"'{hint}' (recommended async driver for {dialect}). "
+                f"Current URL: {config.database_url}",
+                {"dialect": dialect, "suggested_driver": hint},
+            )
+
+    # API prefix should start with /
+    if not config.api_prefix.startswith("/"):
+        result.add_warning(
+            "API_PREFIX_NO_SLASH",
+            f"api_prefix '{config.api_prefix}' should start with '/'.",
+            {"api_prefix": config.api_prefix},
+        )
+
+    # CORS origins
+    if config.enable_cors and not config.cors_origins:
+        result.add_warning(
+            "CORS_NO_ORIGINS",
+            "CORS is enabled but cors_origins list is empty.",
+        )
+
+    # Rate limiting
+    if config.enable_rate_limiting and config.rate_limit_per_minute < 10:
+        result.add_warning(
+            "RATE_LIMIT_TOO_LOW",
+            f"Rate limit of {config.rate_limit_per_minute}/min is very low "
+            f"and may cause issues during development.",
+            {"rate_limit": config.rate_limit_per_minute},
+        )
+
+    # Output dir
+    if not config.output_dir:
+        result.add_error(
+            "EMPTY_OUTPUT_DIR",
+            "output_dir must not be empty.",
+        )
+
+    return result
+
+
+def validate_column_constraints(schema: SchemaDefinition) -> ValidationResult:
+    """
+    Validate column-level semantic constraints:
+    - max_length set only for string types
+    - precision/scale set only for numeric types
+    - autoincrement only on integer PK columns
+    - enum columns have definitions
+
+    Complexity: O(C) total columns.
+    """
+    result: ValidationResult = ValidationResult()
+
+    _STRING_TYPES: FrozenSet[ColumnType] = frozenset(
+        {ColumnType.STRING, ColumnType.VARCHAR, ColumnType.CHAR}
+    )
+    _NUMERIC_PRECISION_TYPES: FrozenSet[ColumnType] = frozenset(
+        {ColumnType.NUMERIC, ColumnType.DOUBLE, ColumnType.FLOAT}
+    )
+    _INTEGER_TYPES: FrozenSet[ColumnType] = frozenset(
+        {ColumnType.INTEGER, ColumnType.BIGINTEGER, ColumnType.SMALLINTEGER}
+    )
+
+    for table in schema.tables:
+        for col in table.columns:
+            ctx: Dict[str, Any] = {"table": table.name, "column": col.name}
+
+            # max_length on non-string
+            if col.max_length is not None and col.column_type not in _STRING_TYPES:
+                result.add_warning(
+                    "MAX_LENGTH_ON_NON_STRING",
+                    f"Column '{col.name}' in '{table.name}' has max_length "
+                    f"but type is '{col.column_type}' — max_length will be "
+                    f"ignored.",
+                    ctx,
+                )
+
+            # precision on non-numeric
+            if (
+                col.precision is not None
+                and col.column_type not in _NUMERIC_PRECISION_TYPES
+            ):
+                result.add_warning(
+                    "PRECISION_ON_NON_NUMERIC",
+                    f"Column '{col.name}' in '{table.name}' has precision "
+                    f"but type is '{col.column_type}'.",
+                    ctx,
+                )
+
+            # autoincrement on non-integer
+            if col.autoincrement and col.column_type not in _INTEGER_TYPES:
+                result.add_error(
+                    "AUTOINCREMENT_NON_INTEGER",
+                    f"Column '{col.name}' in '{table.name}' is "
+                    f"autoincrement but type is '{col.column_type}'. "
+                    f"Autoincrement is only valid for integer types.",
+                    ctx,
+                )
+
+            # autoincrement without PK
+            if col.autoincrement and not col.primary_key:
+                result.add_warning(
+                    "AUTOINCREMENT_NON_PK",
+                    f"Column '{col.name}' in '{table.name}' is autoincrement "
+                    f"but not a primary key. This may cause issues with some "
+                    f"databases.",
+                    ctx,
+                )
+
+            # Very large VARCHAR without need
+            if (
+                col.column_type in _STRING_TYPES
+                and col.max_length is not None
+                and col.max_length > 10000
+            ):
+                result.add_warning(
+                    "VERY_LARGE_VARCHAR",
+                    f"Column '{col.name}' in '{table.name}' has max_length "
+                    f"of {col.max_length}. Consider using TEXT instead.",
+                    ctx,
+                )
+
+    return result
+
+
+def validate_unique_constraints(schema: SchemaDefinition) -> ValidationResult:
+    """
+    Validate multi-column unique constraints.
+
+    Complexity: O(U * k) where U = unique constraints, k = avg columns per constraint.
+    """
+    result: ValidationResult = ValidationResult()
+
+    for table in schema.tables:
+        col_set: Set[str] = {c.name for c in table.columns}
+
+        for uc in table.unique_constraints:
+            ctx: Dict[str, Any] = {
+                "table": table.name,
+                "constraint_name": uc.name or "(unnamed)",
+                "columns": uc.columns,
             }
-            if isinstance(rel_type, str) and rel_type.lower() not in valid_rel_types:
+
+            missing: List[str] = [c for c in uc.columns if c not in col_set]
+            if missing:
                 result.add_error(
-                    "E123", f"Invalid relationship type '{rel_type}'",
-                    f"{model_name}.{rname}",
-                    f"Valid types: {', '.join(valid_rel_types)}"
-                )
-    
-    @classmethod
-    def _validate_model_constraints(cls, model_dict: Dict, result: ValidationResult):
-        """Validate model-level constraints."""
-        name = model_dict.get('name', 'Unknown')
-        
-        # Check table name if custom
-        table_name = model_dict.get('table_name')
-        if table_name:
-            if not re.match(r'^[a-z][a-z0-9_]*$', table_name):
-                result.add_error(
-                    "E130", f"Invalid table name '{table_name}' for model '{name}'",
-                    f"{name}.table_name",
-                    "Table names should be lowercase with underscores"
+                    "UNIQUE_CONSTRAINT_COLUMN_MISSING",
+                    f"Unique constraint on '{table.name}' references "
+                    f"non-existent column(s): {missing}.",
+                    ctx,
                 )
 
+            # Single-column UC that duplicates column.unique flag
+            if len(uc.columns) == 1:
+                col_obj: Optional[ColumnInfo] = table.get_column(uc.columns[0])
+                if col_obj and col_obj.unique:
+                    result.add_info(
+                        "REDUNDANT_UNIQUE_CONSTRAINT",
+                        f"Unique constraint on '{table.name}' for column "
+                        f"'{uc.columns[0]}' is redundant — column already "
+                        f"marked unique.",
+                        ctx,
+                    )
 
-# ============================================================
-# CONFIG VALIDATOR
-# ============================================================
+    return result
 
-class ConfigValidator:
-    """Validates project configuration."""
-    
-    VALID_DB_TYPES = {'postgresql', 'mysql', 'sqlite', 'mongodb'}
-    VALID_AUTH_TYPES = {'jwt', 'session', 'oauth2', 'api_key', 'none'}
-    VALID_CACHE_TYPES = {'redis', 'memcached', 'memory', 'none'}
-    
-    @classmethod
-    def validate(cls, config: Dict[str, Any]) -> ValidationResult:
-        """Validate project configuration."""
-        result = ValidationResult()
-        
-        # Project name
-        project_name = config.get('project_name', config.get('name', ''))
-        if project_name:
-            NameValidator.validate_project_name(project_name, result)
-        else:
-            result.add_error("E200", "Project name is required", "project_name")
-        
-        # Database type
-        db_type = config.get('database', config.get('db_type', 'postgresql'))
-        if isinstance(db_type, str) and db_type.lower() not in cls.VALID_DB_TYPES:
-            result.add_error(
-                "E201", f"Unsupported database type '{db_type}'",
-                "database",
-                f"Supported: {', '.join(cls.VALID_DB_TYPES)}"
-            )
-        
-        # Auth type
-        auth = config.get('auth', config.get('auth_type', 'jwt'))
-        if isinstance(auth, str) and auth.lower() not in cls.VALID_AUTH_TYPES:
-            result.add_error(
-                "E202", f"Unsupported auth type '{auth}'",
-                "auth",
-                f"Supported: {', '.join(cls.VALID_AUTH_TYPES)}"
-            )
-        
-        # Cache type
-        cache = config.get('cache', config.get('cache_type', 'none'))
-        if isinstance(cache, str) and cache.lower() not in cls.VALID_CACHE_TYPES:
+
+def validate_schema_size(schema: SchemaDefinition) -> ValidationResult:
+    """
+    Emit informational messages about schema size for performance awareness.
+
+    Complexity: O(1).
+    """
+    result: ValidationResult = ValidationResult()
+
+    if schema.table_count > 200:
+        result.add_warning(
+            "LARGE_SCHEMA",
+            f"Schema contains {schema.table_count} tables. Generation "
+            f"may take longer than usual. Consider splitting into modules.",
+            {"table_count": schema.table_count},
+        )
+
+    if schema.total_columns > 5000:
+        result.add_warning(
+            "VERY_MANY_COLUMNS",
+            f"Schema has {schema.total_columns} total columns across all "
+            f"tables.",
+            {"total_columns": schema.total_columns},
+        )
+
+    result.add_info(
+        "SCHEMA_STATS",
+        f"Schema: {schema.table_count} tables, "
+        f"{schema.total_columns} columns, "
+        f"{schema.total_relationships} relationships.",
+        {
+            "tables": schema.table_count,
+            "columns": schema.total_columns,
+            "relationships": schema.total_relationships,
+        },
+    )
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Composite validation orchestrators
+# ---------------------------------------------------------------------------
+
+# Type alias for a validation function
+ValidatorFn = Callable[..., ValidationResult]
+
+
+def validate_schema(schema: SchemaDefinition) -> ValidationResult:
+    """
+    Run all schema-level validators.  Returns a merged ``ValidationResult``.
+
+    Complexity: O(T + C + F + R + I + U) — linear in total entities.
+    """
+    result: ValidationResult = ValidationResult()
+
+    validators: List[Callable[[SchemaDefinition], ValidationResult]] = [
+        validate_table_names,
+        validate_column_names,
+        validate_primary_keys,
+        validate_foreign_keys,
+        validate_relationships,
+        validate_indexes,
+        validate_circular_dependencies,
+        validate_enum_definitions,
+        validate_column_constraints,
+        validate_unique_constraints,
+        validate_schema_size,
+    ]
+
+    for validator_fn in validators:
+        logger.debug("Running validator: %s", validator_fn.__name__)
+        sub_result: ValidationResult = validator_fn(schema)
+        result.merge(sub_result)
+
+    logger.info("Schema validation complete: %s", result.summary())
+    return result
+
+
+def validate_config(config: GenerationConfig) -> ValidationResult:
+    """
+    Run all configuration-level validators.
+
+    Complexity: O(1).
+    """
+    result: ValidationResult = validate_generation_config(config)
+    logger.info("Config validation complete: %s", result.summary())
+    return result
+
+
+def validate_full(
+    schema: SchemaDefinition,
+    config: GenerationConfig,
+) -> ValidationResult:
+    """
+    **Master validation entry point.**
+
+    Runs all schema validators, all config validators, and cross-cutting
+    validators (e.g. dialect compatibility).
+
+    This is the single function that ``generator.py`` and ``cli.py`` call
+    before starting code generation.
+
+    Complexity: O(T + C + F + R + I + U) — linear in total schema entities.
+    """
+    logger.info(
+        "Starting full validation — %d tables, dialect=%s",
+        schema.table_count,
+        config.database_dialect,
+    )
+
+    result: ValidationResult = ValidationResult()
+
+    # Schema-level
+    result.merge(validate_schema(schema))
+
+    # Config-level
+    result.merge(validate_config(config))
+
+    # Cross-cutting: dialect compatibility
+    result.merge(validate_dialect_compatibility(schema, config))
+
+    # Cross-cutting: CRUD overrides reference valid tables
+    table_names: Set[str] = {t.name for t in schema.tables}
+    for override_table in config.crud_overrides:
+        if override_table not in table_names:
             result.add_warning(
-                "W200", f"Unknown cache type '{cache}'",
-                "cache",
-                f"Supported: {', '.join(cls.VALID_CACHE_TYPES)}"
+                "CRUD_OVERRIDE_UNKNOWN_TABLE",
+                f"CRUD override defined for table '{override_table}' "
+                f"which does not exist in the schema.",
+                {"table": override_table},
             )
-        
-        # Port
-        port = config.get('port', 8000)
-        if isinstance(port, int):
-            if port < 1 or port > 65535:
-                result.add_error(
-                    "E203", f"Invalid port number {port}",
-                    "port", "Port must be between 1 and 65535"
-                )
-            elif port < 1024:
-                result.add_warning(
-                    "W201", f"Port {port} requires root/admin privileges",
-                    "port", "Use port >= 1024 for development"
-                )
-        
-        # Models validation
-        models = config.get('models', [])
-        if not models:
-            result.add_warning(
-                "W202", "No models defined in configuration",
-                "models", "Add at least one model to generate API endpoints"
-            )
-        
-        # Check for duplicate model names
-        model_names = []
-        for m in models:
-            if isinstance(m, dict):
-                model_names.append(m.get('name', ''))
-            elif hasattr(m, 'name'):
-                model_names.append(m.name)
-        
-        duplicates = [n for n in model_names if model_names.count(n) > 1 and n]
-        if duplicates:
-            result.add_error(
-                "E204", f"Duplicate model names: {set(duplicates)}",
-                "models"
-            )
-        
-        # Validate each model
-        for m in models:
-            if isinstance(m, dict):
-                model_result = ModelValidator.validate(m)
-                result.merge(model_result)
-        
-        return result
-    
-    @classmethod
-    def validate_config_object(cls, config) -> ValidationResult:
-        """Validate a ProjectConfig object."""
-        result = ValidationResult()
-        
-        NameValidator.validate_project_name(config.project_name, result)
-        
-        if config.database not in cls.VALID_DB_TYPES:
-            result.add_error(
-                "E210", f"Unsupported database: {config.database}",
-                "database"
-            )
-        
-        if hasattr(config, 'auth') and config.auth not in cls.VALID_AUTH_TYPES:
-            result.add_error(
-                "E211", f"Unsupported auth type: {config.auth}",
-                "auth"
-            )
-        
-        if not config.models:
-            result.add_warning(
-                "W210", "No models in project config",
-                "models"
-            )
-        
-        return result
 
-
-# ============================================================
-# FILE SYSTEM VALIDATOR
-# ============================================================
-
-class FileSystemValidator:
-    """Validates file system paths and project structure."""
-    
-    @classmethod
-    def validate_output_path(cls, path: str) -> ValidationResult:
-        """Validate output directory path."""
-        result = ValidationResult()
-        
-        if not path:
-            result.add_error("E300", "Output path cannot be empty", "path")
-            return result
-        
-        # Check if path is absolute or relative
-        abs_path = os.path.abspath(path)
-        
-        # Check parent directory exists
-        parent = os.path.dirname(abs_path)
-        if parent and not os.path.exists(parent):
-            result.add_warning(
-                "W300", f"Parent directory does not exist: {parent}",
-                "path", "It will be created automatically"
-            )
-        
-        # Check if target already exists
-        if os.path.exists(abs_path):
-            if os.path.isfile(abs_path):
-                result.add_error(
-                    "E301", f"Path '{path}' exists but is a file, not a directory",
-                    "path"
-                )
-            elif os.listdir(abs_path):
-                result.add_warning(
-                    "W301", f"Directory '{path}' already exists and is not empty",
-                    "path", "Existing files may be overwritten"
-                )
-        
-        # Check path length
-        if len(abs_path) > 255:
-            result.add_warning(
-                "W302", "Path is very long, may cause issues on some systems",
-                "path"
-            )
-        
-        # Check for spaces in path
-        if ' ' in abs_path:
-            result.add_warning(
-                "W303", "Path contains spaces",
-                "path", "Paths without spaces are recommended"
-            )
-        
-        return result
-    
-    @classmethod
-    def validate_project_structure(cls, project_dir: str) -> ValidationResult:
-        """Validate an existing generated project structure."""
-        result = ValidationResult()
-        
-        if not os.path.exists(project_dir):
-            result.add_error("E310", f"Project directory not found: {project_dir}", "path")
-            return result
-        
-        # Expected files/dirs
-        expected_files = [
-            'main.py',
-            'requirements.txt',
-            '.env.example',
-        ]
-        
-        expected_dirs = [
-            'app',
-            'app/models',
-            'app/schemas',
-            'app/routers',
-        ]
-        
-        for f in expected_files:
-            fpath = os.path.join(project_dir, f)
-            if not os.path.isfile(fpath):
-                result.add_warning(
-                    "W310", f"Expected file not found: {f}",
-                    "structure"
-                )
-        
-        for d in expected_dirs:
-            dpath = os.path.join(project_dir, d)
-            if not os.path.isdir(dpath):
-                result.add_warning(
-                    "W311", f"Expected directory not found: {d}",
-                    "structure"
-                )
-        
-        if result.is_valid:
-            result.add_info("I310", "Project structure looks valid", "structure")
-        
-        return result
-
-
-# ============================================================
-# MASTER VALIDATOR (ALL-IN-ONE)
-# ============================================================
-
-class ProjectValidator:
-    """Master validator - validates entire project configuration."""
-    
-    @classmethod
-    def validate_all(cls, config: Dict[str, Any],
-                     output_path: str = None) -> ValidationResult:
-        """Run all validations on project configuration."""
-        result = ValidationResult()
-        
-        # 1. Config validation
-        config_result = ConfigValidator.validate(config)
-        result.merge(config_result)
-        
-        # 2. Output path validation
-        if output_path:
-            path_result = FileSystemValidator.validate_output_path(output_path)
-            result.merge(path_result)
-        
-        # 3. Cross-model validation
-        cls._validate_cross_model_references(config, result)
-        
-        return result
-    
-    @classmethod
-    def _validate_cross_model_references(cls, config: Dict, result: ValidationResult):
-        """Validate that all model references are valid."""
-        models = config.get('models', [])
-        
-        model_names = set()
-        for m in models:
-            if isinstance(m, dict):
-                model_names.add(m.get('name', ''))
-            elif hasattr(m, 'name'):
-                model_names.add(m.name)
-        
-        # Check relationship targets
-        for m in models:
-            if isinstance(m, dict):
-                mname = m.get('name', '')
-                for rel in m.get('relationships', []):
-                    target = rel.get('target_model', rel.get('target', ''))
-                    if target and target not in model_names:
-                        result.add_warning(
-                            "W400",
-                            f"Model '{mname}' references '{target}' which is not defined",
-                            f"{mname}.relationships",
-                            f"Make sure '{target}' model exists or will be created"
-                        )
-
-
-# ============================================================
-# QUICK VALIDATION FUNCTIONS
-# ============================================================
-
-def validate_model_name(name: str) -> Tuple[bool, str]:
-    """Quick validation for model name. Returns (is_valid, message)."""
-    result = ValidationResult()
-    NameValidator.validate_model_name(name, result)
-    
-    if result.is_valid:
-        return True, f"✅ '{name}' is a valid model name"
+    if result.has_errors:
+        logger.error(
+            "Validation FAILED with %d error(s). %s",
+            result.error_count,
+            result.summary(),
+        )
     else:
-        errors = "; ".join(e.message for e in result.errors)
-        return False, f"❌ {errors}"
+        logger.info("Validation PASSED. %s", result.summary())
+
+    return result
 
 
-def validate_field_name(name: str, model: str = "Model") -> Tuple[bool, str]:
-    """Quick validation for field name."""
-    result = ValidationResult()
-    NameValidator.validate_field_name(name, model, result)
-    
-    if result.is_valid:
-        return True, f"✅ '{name}' is a valid field name"
-    else:
-        errors = "; ".join(e.message for e in result.errors)
-        return False, f"❌ {errors}"
+# ---------------------------------------------------------------------------
+# Module-level exports
+# ---------------------------------------------------------------------------
 
+__all__: List[str] = [
+    "ValidationError",
+    "ValidationResult",
+    "validate_table_names",
+    "validate_column_names",
+    "validate_primary_keys",
+    "validate_foreign_keys",
+    "validate_relationships",
+    "validate_indexes",
+    "validate_circular_dependencies",
+    "validate_dialect_compatibility",
+    "validate_enum_definitions",
+    "validate_generation_config",
+    "validate_column_constraints",
+    "validate_unique_constraints",
+    "validate_schema_size",
+    "validate_schema",
+    "validate_config",
+    "validate_full",
+]
 
-def validate_project_config(config: Dict) -> ValidationResult:
-    """Validate project configuration dict."""
-    return ConfigValidator.validate(config)
-
-
-def validate_quick(name: str, name_type: str = "model") -> bool:
-    """Quick boolean check for name validity."""
-    result = ValidationResult()
-    
-    if name_type == "model":
-        NameValidator.validate_model_name(name, result)
-    elif name_type == "field":
-        NameValidator.validate_field_name(name, "Model", result)
-    elif name_type == "project":
-        NameValidator.validate_project_name(name, result)
-    
-    return result.is_valid
+logger.debug("apigen.validators loaded — %d public symbols.", len(__all__))
